@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use endure::redb::backends::FileBackend;
 use endure::redb::{Database, StorageBackend};
-use endure::{Durable, DurableMap, Error};
+use endure::{Durable, DurableCell, DurableMap, Error};
+use serde::{Deserialize, Deserializer, Serialize};
 use tempfile::TempDir;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -463,5 +464,60 @@ fn opening_a_current_file_commits_nothing() -> eyre::Result<()> {
     })?;
 
     assert_eq!(endure, bare, "opening a current file committed");
+    Ok(())
+}
+
+// counts down decodes; the one that reaches zero panics
+static DECODES_UNTIL_PANIC: AtomicUsize = AtomicUsize::new(0);
+
+// panics in `deserialize` while armed, the way a buggy decoder might during a reload
+#[derive(Clone, Default, Serialize)]
+struct Touchy(u32);
+
+impl<'de> Deserialize<'de> for Touchy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let left = DECODES_UNTIL_PANIC.try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+            left.checked_sub(1)
+        });
+        assert!(left != Ok(1), "injected decode failure");
+        Ok(Self(u32::deserialize(deserializer)?))
+    }
+}
+
+#[derive(Clone, Durable)]
+struct TouchyStore {
+    value: DurableCell<Touchy>,
+}
+
+#[test]
+fn a_panic_while_reloading_poisons_the_handle() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("touchy.redb");
+    let faults = Faults::new(Fail::AfterSync);
+
+    let store = {
+        let path = path.clone();
+        let faults = faults.clone();
+        TouchyStore::builder()
+            .backend_with(move || FlakyBackend::open(&path, faults.clone()))
+            .open()?
+    };
+    store.update_blocking(|s| s.value.set(Touchy(1)))?;
+
+    // the commit lands and reports an error; the first decode checks the new value before the
+    // write, and the second, during the reload that follows, panics
+    faults.fail_next(1);
+    DECODES_UNTIL_PANIC.store(2, Ordering::SeqCst);
+    let result = store.update_blocking(|s| s.value.set(Touchy(2)));
+    DECODES_UNTIL_PANIC.store(0, Ordering::SeqCst);
+
+    assert!(
+        matches!(result, Err(Error::CommitFailed(_))),
+        "got {result:?}"
+    );
+    assert!(store.is_poisoned());
+
+    let next = store.update_blocking(|s| s.value.set(Touchy(3)));
+    assert!(matches!(next, Err(Error::Poisoned)), "got {next:?}");
     Ok(())
 }

@@ -277,7 +277,7 @@ where
     fn all_ops(&self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
         for (key, value) in self.entries.iter() {
             ops.push(Op {
-                key: codec::encode_checked(table, key)?,
+                key: codec::encode_key(table, key)?,
                 value: Some(codec::encode_checked(table, value)?),
             });
         }
@@ -292,7 +292,7 @@ where
                 for key in previous.entries.keys() {
                     if !self.entries.contains_key(key) {
                         ops.push(Op {
-                            key: codec::encode_checked(table, key)?,
+                            key: codec::encode_key(table, key)?,
                             value: None,
                         });
                     }
@@ -310,7 +310,7 @@ where
                     };
 
                     ops.push(Op {
-                        key: codec::encode_checked(table, &key)?,
+                        key: codec::encode_key(table, &key)?,
                         value,
                     });
                 }

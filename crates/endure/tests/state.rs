@@ -699,7 +699,7 @@ async fn hooks_after_async_updates_can_spawn_tasks() -> eyre::Result<()> {
 }
 
 #[test]
-fn a_caught_comparator_panic_still_saves_the_order() -> eyre::Result<()> {
+fn a_caught_comparator_panic_leaves_the_order_unchanged() -> eyre::Result<()> {
     #[derive(Clone, Durable)]
     struct Numbers {
         list: DurableVec<u32>,
@@ -723,6 +723,7 @@ fn a_caught_comparator_panic_still_saves_the_order() -> eyre::Result<()> {
     })?;
 
     let in_memory: Vec<u32> = numbers.read().list.iter().copied().collect();
+    assert_eq!(in_memory, (0..40).rev().collect::<Vec<_>>());
     drop(numbers);
 
     let reopened = Numbers::builder().dir(dir.path()).open()?;
@@ -761,5 +762,97 @@ fn builders_can_move_to_another_thread() -> eyre::Result<()> {
         .expect("thread")?;
 
     assert!(app.path().is_some());
+    Ok(())
+}
+
+thread_local! {
+    static PANIC_ON_CLONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// panics in `clone` while armed, the way a fallible user type might
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct Fragile(u64);
+
+impl Clone for Fragile {
+    fn clone(&self) -> Self {
+        assert!(
+            !PANIC_ON_CLONE.with(|armed| armed.replace(false)),
+            "injected clone failure"
+        );
+        Self(self.0)
+    }
+}
+
+#[derive(Clone, Durable)]
+struct FragileList {
+    items: DurableVec<Fragile>,
+}
+
+#[test]
+fn a_caught_clone_panic_leaves_the_list_matching_disk() -> eyre::Result<()> {
+    let edits: [fn(&mut DurableVec<Fragile>); 5] = [
+        |items| {
+            items.pop();
+        },
+        |items| {
+            items.pop_front();
+        },
+        |items| {
+            items.remove(5);
+        },
+        |items| items.insert(5, Fragile(99)),
+        |items| items.truncate(3),
+    ];
+
+    for edit in edits {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("fragile.redb");
+        let state = FragileList::builder().path(&path).open()?;
+        state.update_blocking(|s| s.items.extend((0..100).map(Fragile)))?;
+
+        // the edit clones shared elements before changing them, and the clone panics
+        state.update_blocking(|s| {
+            PANIC_ON_CLONE.with(|armed| armed.set(true));
+            let result = catch_unwind(AssertUnwindSafe(|| edit(&mut s.items)));
+            PANIC_ON_CLONE.with(|armed| armed.set(false));
+            assert!(result.is_err(), "the edit must reach the injected panic");
+        })?;
+
+        let memory: Vec<u64> = state.read().items.iter().map(|item| item.0).collect();
+        drop(state);
+
+        let state = FragileList::builder().path(&path).open()?;
+        let disk: Vec<u64> = state.read().items.iter().map(|item| item.0).collect();
+        assert_eq!(memory, disk);
+    }
+
+    Ok(())
+}
+
+// two different keys that encode to the same bytes, since `id` is not stored
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct LossyKey {
+    group: u32,
+    #[serde(skip)]
+    id: u32,
+}
+
+#[derive(Clone, Durable)]
+struct LossyMap {
+    items: DurableMap<LossyKey, String>,
+}
+
+#[test]
+fn keys_that_do_not_read_back_as_themselves_are_refused() -> eyre::Result<()> {
+    let state = LossyMap::memory();
+    state.update_blocking(|s| s.items.insert(LossyKey { group: 1, id: 0 }, "kept".into()))?;
+
+    let result =
+        state.update_blocking(|s| s.items.insert(LossyKey { group: 1, id: 1 }, "x".into()));
+    assert!(
+        matches!(result, Err(Error::Encode { .. })),
+        "got {result:?}"
+    );
+    assert_eq!(state.read().items.len(), 1);
     Ok(())
 }

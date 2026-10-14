@@ -1,0 +1,5 @@
+error: versions must be consecutive; expected 2 after 1
+ --> tests/ui/version_gap.rs:5:32
+  |
+5 |     #[durable(versions(u8 = 1, u16 = 3))]
+  |                                ^^^

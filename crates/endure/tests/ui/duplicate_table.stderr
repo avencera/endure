@@ -1,0 +1,5 @@
+error: two fields are stored in table `count`
+ --> tests/ui/duplicate_table.rs:7:5
+  |
+7 |     other: DurableCell<u32>,
+  |     ^^^^^

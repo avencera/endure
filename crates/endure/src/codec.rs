@@ -4,6 +4,8 @@
 //! self-describing, so adding a field marked `#[serde(default)]` or removing a field needs no
 //! migration, unlike positional formats such as postcard or bincode
 
+use std::cmp::Ordering;
+
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::error::{Error, Result};
@@ -26,6 +28,28 @@ pub fn encode_checked<T: Serialize + DeserializeOwned>(table: &str, value: &T) -
         table: table.to_owned(),
         message: format!("the encoded value would not read back: {error}"),
     })?;
+
+    Ok(bytes)
+}
+
+/// Encodes a map key and checks that the bytes decode to an equal key
+///
+/// A key whose encoding loses part of its identity, such as a field marked `#[serde(skip)]`,
+/// would share a row with other keys, so a write or delete of one would hit the others
+pub fn encode_key<K: Serialize + DeserializeOwned + Ord>(table: &str, key: &K) -> Result<Vec<u8>> {
+    let bytes = encode(table, key)?;
+    let decoded: K = decode(table, &bytes).map_err(|error| Error::Encode {
+        table: table.to_owned(),
+        message: format!("the encoded key would not read back: {error}"),
+    })?;
+
+    // maps compare keys with `Ord`, so that is the identity the bytes must keep
+    if decoded.cmp(key) != Ordering::Equal {
+        return Err(Error::Encode {
+            table: table.to_owned(),
+            message: "the encoded key reads back as a different key".to_owned(),
+        });
+    }
 
     Ok(bytes)
 }

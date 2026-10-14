@@ -50,7 +50,7 @@ If you've used one of these, endure will feel familiar:
 
 Pushing, inserting or removing one `DurableVec` element writes one row; nothing shifts on disk. Cloning any collection is O(1), because the data lives in structurally shared trees from [imbl](https://github.com/jneem/imbl).
 
-Keys and values need `Clone` and serde's `Serialize` and `Deserialize`. Map keys also need `Ord`. Before anything is written, endure checks that each changed value can be decoded again. A type that can't be read back, such as one using `skip_serializing_if` without `default`, is refused with `Error::Encode` instead of leaving a file that won't open.
+Keys and values need `Clone` and serde's `Serialize` and `Deserialize`. Map keys also need `Ord`. Before anything is written, endure checks that each changed value can be decoded again. A type that can't be read back, such as one using `skip_serializing_if` without `default`, is refused with `Error::Encode` instead of leaving a file that won't open. Map keys must also read back as the same key, so a key type with a `#[serde(skip)]` field, where two different keys would share one stored row, is refused the same way.
 
 Fields marked `#[durable(skip)]` live in memory only and start as `Default::default()`.
 
@@ -191,7 +191,7 @@ let app = App::builder()
 
 - The whole state is loaded into memory when it opens. It suits app state, settings, queues and indexes, not large datasets.
 - A `DurableCell` holds its value behind an `Arc`, so the first change in an update copies the whole value and the commit rewrites it. Keep large collections in a `DurableMap` or `DurableVec`.
-- Map keys are not versioned. Adding a `#[serde(default)]` field to a key type or removing one works: keys stored under old bytes are rewritten when the state opens. Any other key change needs a manual migration. Keys that compare equal with `Ord` must also serialize identically.
+- Map keys are not versioned. Adding a `#[serde(default)]` field to a key type or removing one works: keys stored under old bytes are rewritten when the state opens. Any other key change needs a manual migration. Keys that compare equal with `Ord` must also serialize identically, and keys that differ must serialize differently.
 - Switching a field between `DurableMap`, `DurableVec` and `DurableCell` needs a new table name. A cell refuses to open over other rows, but a map or list may misread them.
 - Values must not use interior mutability such as `RefCell` or `Mutex`. Snapshots share values, so a change made through one is visible in every snapshot at once, is not rolled back when the closure fails, and is saved only if a tracked mutation rewrites the same entry.
 - Serde attributes that lose data, such as `#[serde(skip)]`, apply on disk too. After a restart a skipped field comes back as its default. `Option<Option<T>>` can't tell `Some(None)` from `None` once stored.

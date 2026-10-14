@@ -11,6 +11,10 @@ use crate::tracker::{Pending, Tracker};
 
 // each element is stored under a hidden u64 order key; keys increase along the vector and leave
 // gaps so a push or an insert writes one row instead of shifting every later element
+//
+// structural edits run on a copy of `items` and change `keys` only after it is installed: imbl
+// clones shared elements partway through an edit, and a panicking `Clone` caught inside the
+// update must leave both vectors as they were, while key edits never panic
 const STEP: u64 = 1 << 32;
 const BASE: u64 = 1 << 62;
 
@@ -85,9 +89,9 @@ impl<T: Clone> DurableVec<T> {
             }
         };
 
-        self.tracker.touch(&key, false);
+        self.edit_items(|items| items.push_back(value));
         self.keys.push_back(key);
-        self.items.push_back(value);
+        self.tracker.touch(&key, false);
     }
 
     /// Prepends an element
@@ -97,16 +101,24 @@ impl<T: Clone> DurableVec<T> {
 
     /// Removes and returns the last element
     pub fn pop(&mut self) -> Option<T> {
-        let key = self.keys.pop_back()?;
+        let item = self.edit_items(imbl::Vector::pop_back)?;
+        let key = self
+            .keys
+            .pop_back()
+            .expect("keys and items have equal length");
         self.tracker.touch(&key, true);
-        self.items.pop_back()
+        Some(item)
     }
 
     /// Removes and returns the first element
     pub fn pop_front(&mut self) -> Option<T> {
-        let key = self.keys.pop_front()?;
+        let item = self.edit_items(imbl::Vector::pop_front)?;
+        let key = self
+            .keys
+            .pop_front()
+            .expect("keys and items have equal length");
         self.tracker.touch(&key, true);
-        self.items.pop_front()
+        Some(item)
     }
 
     /// Inserts an element at `index`, shifting later elements right
@@ -135,9 +147,9 @@ impl<T: Clone> DurableVec<T> {
             }
         };
 
-        self.tracker.touch(&key, false);
+        self.edit_items(|items| items.insert(index, value));
         self.keys.insert(index, key);
-        self.items.insert(index, value);
+        self.tracker.touch(&key, false);
     }
 
     /// Removes and returns the element at `index`, shifting later elements left
@@ -146,9 +158,10 @@ impl<T: Clone> DurableVec<T> {
     ///
     /// Panics if `index >= len`
     pub fn remove(&mut self, index: usize) -> T {
+        let item = self.edit_items(|items| items.remove(index));
         let key = self.keys.remove(index);
         self.tracker.touch(&key, true);
-        self.items.remove(index)
+        item
     }
 
     /// Shortens the list to `len` elements
@@ -157,12 +170,12 @@ impl<T: Clone> DurableVec<T> {
             return;
         }
 
+        self.edit_items(|items| items.truncate(len));
         for key in self.keys.iter().skip(len) {
             self.tracker.touch(key, true);
         }
 
         self.keys.truncate(len);
-        self.items.truncate(len);
     }
 
     /// Removes every element
@@ -192,9 +205,9 @@ impl<T: Clone> DurableVec<T> {
 
     /// Sorts the list with a comparator, rewriting every element
     pub fn sort_by(&mut self, compare: impl Fn(&T, &T) -> Ordering) {
-        // record first, since a panicking comparator can leave elements moved
+        // a panicking comparator leaves only the copy half sorted
+        self.edit_items(|items| items.sort_by(compare));
         self.touch_all();
-        self.items.sort_by(compare);
     }
 
     /// Sorts the list, rewriting every element
@@ -232,6 +245,13 @@ impl<T: Clone> DurableVec<T> {
         for key in self.keys.iter() {
             self.tracker.touch(key, false);
         }
+    }
+
+    fn edit_items<R>(&mut self, edit: impl FnOnce(&mut imbl::Vector<T>) -> R) -> R {
+        let mut items = self.items.clone();
+        let result = edit(&mut items);
+        self.items = items;
+        result
     }
 
     fn touch_all(&mut self) {
@@ -335,6 +355,15 @@ where
     }
 
     fn take_ops(&mut self, previous: &Self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
+        // a second guard for the ordering rule above: never write a list whose rows and keys
+        // disagree
+        if self.items.len() != self.keys.len() {
+            return Err(Error::Encode {
+                table: table.to_owned(),
+                message: "list elements and their order keys are out of step".to_owned(),
+            });
+        }
+
         match self.tracker.take(&previous.tracker) {
             // the list was swapped for a different one, so its dirty set says nothing about storage
             Pending::Rewrite => {

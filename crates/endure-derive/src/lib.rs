@@ -99,7 +99,9 @@ enum FieldKind {
 fn endure_path() -> TokenStream2 {
     match crate_name("endure") {
         Ok(FoundCrate::Name(name)) => {
-            let name = Ident::new(&name, Span::call_site());
+            // a dependency renamed to a keyword, such as `async`, is written `r#async`
+            let name = syn::parse_str::<Ident>(&name)
+                .unwrap_or_else(|_| Ident::new_raw(&name, Span::call_site()));
             quote! { ::#name }
         }
         // inside endure's own tests and examples, and when the lookup fails, use the real name
@@ -295,6 +297,10 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
                 Ok(())
             } else if meta.path.is_ident("table") {
                 let value: LitStr = meta.value()?.parse()?;
+                if value.value().is_empty() {
+                    return Err(syn::Error::new_spanned(value, "table names cannot be empty"));
+                }
+
                 table = Some(value.value());
                 Ok(())
             } else if meta.path.is_ident("version") {

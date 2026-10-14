@@ -7,5 +7,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
-storage = { package = "endure", path = "../endure" }
+# a keyword alias also checks that the derive writes it as a raw identifier
+async = { package = "endure", path = "../endure" }
 serde = { version = "1", features = ["derive"] }

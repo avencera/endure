@@ -404,14 +404,23 @@ impl<S: State> Inner<S> {
                 Ok(())
             }
             Err(error) => {
-                self.recover(&mut storage, &next, number);
+                // a panic anywhere in recovery, such as a value decoder panicking on reload,
+                // must not leave a handle that looks healthy while it serves stale state
+                let recovered = catch_unwind(AssertUnwindSafe(|| {
+                    self.reload(&mut storage, &next, number)
+                }));
+                if !matches!(recovered, Ok(true)) {
+                    self.poisoned.store(true, Ordering::Release);
+                }
+
                 Err(Error::CommitFailed(Box::new(error)))
             }
         }
     }
 
-    // a failed commit may or may not have reached storage, so reload instead of guessing
-    fn recover(&self, storage: &mut Storage, next: &S, number: u64) {
+    // a failed commit may or may not have reached storage, so reload instead of guessing;
+    // returns false when the state could not be reloaded
+    fn reload(&self, storage: &mut Storage, next: &S, number: u64) -> bool {
         let previous = self.current.load_full();
         // memory-only fields follow the persisted ones: when the failed commit is on disk after
         // all, the closure's edits to them stand too
@@ -422,27 +431,26 @@ impl<S: State> Inner<S> {
         {
             storage.last_commit = last;
             self.publish_reload(state);
-            return;
+            return true;
         }
 
         // redb refuses all further work after an I/O error, so open the storage again; the old
         // handle is dropped first to release its file lock
-        if let Some(reopen) = &self.reopen {
-            storage.db = None;
+        let Some(reopen) = &self.reopen else {
+            return false;
+        };
 
-            let reopened = catch_unwind(AssertUnwindSafe(reopen))
-                .unwrap_or_else(|panic| Err(Error::BackendPanicked(panic_message(&panic))))
-                .and_then(|db| load(&db, carry).map(|loaded| (db, loaded)));
+        storage.db = None;
+        let Ok((db, (state, last))) =
+            reopen().and_then(|db| load(&db, carry).map(|loaded| (db, loaded)))
+        else {
+            return false;
+        };
 
-            if let Ok((db, (state, last))) = reopened {
-                storage.db = Some(db);
-                storage.last_commit = last;
-                self.publish_reload(state);
-                return;
-            }
-        }
-
-        self.poisoned.store(true, Ordering::Release);
+        storage.db = Some(db);
+        storage.last_commit = last;
+        self.publish_reload(state);
+        true
     }
 
     fn publish_reload(&self, state: S) {

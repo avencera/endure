@@ -22,6 +22,7 @@ thiserror = "2"
 tokio = { version = "1.53", default-features = false, features = ["sync", "rt"] }
 
 [dev-dependencies]
+trybuild = "1.0.122"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "time"] }
 tempfile = "3.27"

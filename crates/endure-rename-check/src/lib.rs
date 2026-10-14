@@ -1,8 +1,8 @@
 //! Compiles only if `#[derive(Durable)]` finds endure under the name the manifest gives it
 
-#[derive(Clone, storage::Durable)]
+#[derive(Clone, r#async::Durable)]
 pub struct Renamed {
-    pub count: storage::DurableCell<u32>,
+    pub count: r#async::DurableCell<u32>,
 }
 
 #[cfg(test)]

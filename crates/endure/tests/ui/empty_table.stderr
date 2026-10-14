@@ -1,0 +1,5 @@
+error: table names cannot be empty
+ --> tests/ui/empty_table.rs:5:23
+  |
+5 |     #[durable(table = "")]
+  |                       ^^
