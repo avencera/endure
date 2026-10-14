@@ -27,6 +27,19 @@ app.update(|s| {
 .await?;
 ```
 
+## Similar ideas elsewhere
+
+If you've used one of these, endure will feel familiar:
+
+| Tool | What's alike | What's different |
+|---|---|---|
+| SwiftUI `@AppStorage` and the web's `localStorage` | Assign a value and it's still there next launch | Those hold single small values. endure holds typed maps and lists, and commits several changes atomically |
+| SwiftData `@Model` | A macro on ordinary types makes them persistent, and changes are tracked for you | SwiftData saves in the background. endure saves when `update` returns, so you know the data is on disk |
+| Jetpack DataStore (`updateData { }`, `data: Flow`) | Updates are atomic read-modify-write closures that run one at a time and finish once on disk. Readers watch a stream of the latest state | DataStore rewrites the whole object on every change. endure writes only the entries that changed |
+| Clojure's `duratom` | An atom backed by storage: `swap!` with a function, and the result persists | endure tracks changes per entry instead of writing the whole value, and rolls back if the function fails |
+| Python's `shelve` | A dict-like object backed by a file | endure is typed, transactional, and safe to share across threads |
+| Cloudflare Durable Objects | One owner per state, transactional storage, and no reply until the write is durable | endure runs in your process against a local file |
+
 ## Collections
 
 | Type | Behaves like | Stored as |
