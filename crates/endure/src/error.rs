@@ -29,6 +29,23 @@ pub enum Error {
         supported: u32,
     },
 
+    /// The stored values are older than the oldest version this build can upgrade
+    #[error(
+        "table `{table}` is at schema version {found}, but this build can only upgrade from version {oldest}"
+    )]
+    OlderSchema {
+        table: String,
+        found: u32,
+        oldest: u32,
+    },
+
+    /// A commit failed, so its changes may or may not have been saved
+    ///
+    /// The handle reloads the state from storage after a failed commit, so
+    /// [`read`](crate::Durable::read) shows what was actually saved unless the handle is poisoned
+    #[error("commit failed and may or may not have been saved: {0}")]
+    CommitFailed(Box<Error>),
+
     /// The file was written by a newer, incompatible version of endure
     #[error("database format version {found} is newer than the supported version {supported}")]
     UnsupportedFormat { found: u32, supported: u32 },
@@ -41,8 +58,11 @@ pub enum Error {
     #[error("other handles to this state are still alive")]
     InUse,
 
-    /// A commit failed and reloading from disk also failed, so memory may no longer match disk
-    #[error("state is poisoned after a failed commit and reload; reopen it")]
+    /// A commit failed and the state could not be reloaded, so memory may no longer match storage
+    ///
+    /// Reads still return the last state this handle knew about. Drop every handle and open the
+    /// state again to recover
+    #[error("state is poisoned after a failed commit; reopen it")]
     Poisoned,
 }
 
@@ -68,8 +88,9 @@ from_redb!(
 
 /// The error from [`Durable::try_update`](crate::Durable::try_update)
 ///
-/// `Rejected` carries the closure's own error; nothing was written and memory is unchanged
-/// `Storage` means the closure succeeded but the commit failed; memory then matches what is on disk
+/// - `Rejected` carries the closure's own error; nothing was written
+/// - `Storage` means the closure succeeded but its changes were not committed; see
+///   [`Error::CommitFailed`]
 #[derive(Debug)]
 pub enum UpdateError<E> {
     /// The update closure returned an error

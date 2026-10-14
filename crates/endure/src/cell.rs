@@ -2,7 +2,7 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
 use crate::error::Result;
@@ -89,7 +89,7 @@ impl<T: Eq> Eq for DurableCell<T> {}
 
 impl<T> Field for DurableCell<T>
 where
-    T: Clone + Default + Serialize + Send + Sync + 'static,
+    T: Clone + Default + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     type Item = T;
 
@@ -114,7 +114,7 @@ where
         if std::mem::take(&mut self.dirty) {
             ops.push(Op {
                 key: CELL_KEY.to_vec(),
-                value: Some(codec::encode(table, &*self.value)?),
+                value: Some(codec::encode_checked(table, &*self.value)?),
             });
         }
 

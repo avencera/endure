@@ -4,15 +4,21 @@ use std::collections::HashSet;
 
 use heck::ToSnakeCase;
 use proc_macro::TokenStream;
-use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{Data, DeriveInput, Fields, Ident, LitStr, Type, parse_macro_input};
+use syn::ext::IdentExt;
+use syn::parse::{Parse, ParseStream};
+use syn::punctuated::Punctuated;
+use syn::{
+    Data, DeriveInput, Fields, Ident, LitInt, LitStr, Token, Type, parenthesized, parse_macro_input,
+};
 
 /// Makes a struct of durable collections openable as persistent state
 ///
 /// Every field must be a [`DurableMap`], [`DurableCell`], or [`DurableVec`], or be marked
-/// `#[durable(skip)]`. The derive implements `Clone` and adds `open()`, `builder()`, and
-/// `memory()` constructors, so do not also derive `Clone`
+/// `#[durable(skip)]`. The struct must also implement `Clone`, usually through
+/// `#[derive(Clone, Durable)]`. The derive adds `open()`, `builder()`, and `memory()`
+/// constructors
 ///
 /// Struct attributes:
 /// - `#[durable(name = "file_stem")]` sets the default file name; the default is the struct name
@@ -22,9 +28,11 @@ use syn::{Data, DeriveInput, Fields, Ident, LitStr, Type, parse_macro_input};
 /// - `#[durable(skip)]` keeps the field in memory only; it starts as `Default::default()`
 /// - `#[durable(table = "name")]` stores the field in a table with this name instead of the field
 ///   name, which lets a field be renamed without losing its data
-/// - `#[durable(versions(V1, V2))]` lists earlier value types, oldest first. Stored values are
-///   upgraded through `From` impls (`V1` into `V2`, `V2` into the current type) when the state
-///   opens
+/// - `#[durable(versions(V1 = 1, V2 = 2))]` lists earlier value types with their schema version
+///   numbers, oldest first and consecutive. The current type gets the next number. Stored values
+///   are upgraded through `From` impls (`V1` into `V2`, `V2` into the current type) when the state
+///   opens. Drop the oldest entries once no stored data needs them; data older than the first
+///   listed version then fails to open instead of being misread
 ///
 /// [`DurableMap`]: https://docs.rs/endure/latest/endure/struct.DurableMap.html
 /// [`DurableCell`]: https://docs.rs/endure/latest/endure/struct.DurableCell.html
@@ -39,9 +47,38 @@ pub fn derive_durable(input: TokenStream) -> TokenStream {
 
 struct PersistedField {
     ident: Ident,
+    // the field name without any `r#` prefix; also the default table name
+    name: String,
     ty: Type,
     table: String,
-    versions: Vec<syn::Path>,
+    versions: Vec<OldVersion>,
+}
+
+impl PersistedField {
+    fn oldest_version(&self) -> u32 {
+        self.versions.first().map_or(1, |old| old.number)
+    }
+
+    fn current_version(&self) -> u32 {
+        self.versions.last().map_or(1, |old| old.number + 1)
+    }
+}
+
+struct OldVersion {
+    ty: Type,
+    number: u32,
+}
+
+impl Parse for OldVersion {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let ty = input.parse()?;
+        input.parse::<Token![=]>()?;
+        let number: LitInt = input.parse()?;
+        Ok(Self {
+            ty,
+            number: number.base10_parse()?,
+        })
+    }
 }
 
 enum FieldKind {
@@ -73,7 +110,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         ));
     };
 
-    let file_name = struct_name(&input)?.unwrap_or_else(|| name.to_string().to_snake_case());
+    let file_name =
+        struct_name(&input)?.unwrap_or_else(|| name.unraw().to_string().to_snake_case());
 
     let mut fields = Vec::new();
     let mut tables = HashSet::new();
@@ -100,19 +138,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         fields.push(kind);
     }
 
-    let all_idents: Vec<&Ident> = fields
-        .iter()
-        .map(|kind| match kind {
-            FieldKind::Persisted(field) => &field.ident,
-            FieldKind::Skipped(ident) => ident,
-        })
-        .collect();
-
     let specs = fields.iter().filter_map(|kind| match kind {
         FieldKind::Persisted(field) => {
-            let field_name = field.ident.to_string();
+            let field_name = &field.name;
             let table = &field.table;
-            let version = current_version(field);
+            let version = field.current_version();
             Some(quote! {
                 ::endure::__private::FieldSpec { name: #field_name, table: #table, version: #version }
             })
@@ -125,19 +155,30 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             let ident = &field.ident;
             let ty = &field.ty;
             let table = &field.table;
-            let version = current_version(field);
+            let oldest = field.oldest_version();
+            let current = field.current_version();
             let decode = decode_chain(field);
             quote! {
-                #ident: loader.field::<#ty>(#table, #version, |__version: u32, __bytes: &[u8]| { #decode })?
+                #ident: loader.field::<#ty>(
+                    #table,
+                    ::endure::__private::Versions { oldest: #oldest, current: #current },
+                    |__version: u32, __bytes: &[u8]| { #decode },
+                )?
             }
         }
-        FieldKind::Skipped(ident) => quote! { #ident: ::core::default::Default::default() },
+        // memory-only fields survive a reload and start empty on open
+        FieldKind::Skipped(ident) => quote! {
+            #ident: match previous {
+                ::core::option::Option::Some(previous) => ::core::clone::Clone::clone(&previous.#ident),
+                ::core::option::Option::None => ::core::default::Default::default(),
+            }
+        },
     });
 
     let takes = fields.iter().filter_map(|kind| match kind {
         FieldKind::Persisted(field) => {
             let ident = &field.ident;
-            let field_name = ident.to_string();
+            let field_name = &field.name;
             let table = &field.table;
             Some(quote! { changes.field(#field_name, #table, &mut self.#ident)?; })
         }
@@ -145,12 +186,6 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     });
 
     Ok(quote! {
-        impl ::core::clone::Clone for #name {
-            fn clone(&self) -> Self {
-                Self { #(#all_idents: ::core::clone::Clone::clone(&self.#all_idents)),* }
-            }
-        }
-
         impl ::endure::__private::State for #name {
             const NAME: &'static str = #file_name;
             const APP: &'static str = ::core::env!("CARGO_PKG_NAME");
@@ -160,7 +195,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 FIELDS
             }
 
-            fn load(loader: &mut ::endure::__private::Loader<'_>) -> ::endure::Result<Self> {
+            #[allow(unused_variables)]
+            fn load(
+                loader: &mut ::endure::__private::Loader<'_>,
+                previous: ::core::option::Option<&Self>,
+            ) -> ::endure::Result<Self> {
                 ::core::result::Result::Ok(Self { #(#loads),* })
             }
 
@@ -229,10 +268,17 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
                 table = Some(value.value());
                 Ok(())
             } else if meta.path.is_ident("versions") {
-                meta.parse_nested_meta(|version| {
-                    versions.push(version.path);
-                    Ok(())
-                })
+                let content;
+                parenthesized!(content in meta.input);
+                let parsed = Punctuated::<OldVersion, Token![,]>::parse_terminated(&content)
+                    .map_err(|error| {
+                        syn::Error::new(
+                            error.span(),
+                            "expected `versions(OldType = 1, NewerType = 2, ..)`",
+                        )
+                    })?;
+                versions.extend(parsed);
+                Ok(())
             } else {
                 Err(meta.error(
                     "unknown durable field attribute; expected `skip`, `table`, or `versions`",
@@ -252,17 +298,37 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
         return Ok(FieldKind::Skipped(ident));
     }
 
-    let table = table.unwrap_or_else(|| ident.to_string());
+    if let Some(first) = versions.first()
+        && first.number == 0
+    {
+        return Err(syn::Error::new_spanned(
+            &first.ty,
+            "schema versions start at 1",
+        ));
+    }
+
+    for pair in versions.windows(2) {
+        if pair[1].number != pair[0].number + 1 {
+            return Err(syn::Error::new_spanned(
+                &pair[1].ty,
+                format!(
+                    "versions must be consecutive; expected {} after {}",
+                    pair[0].number + 1,
+                    pair[0].number
+                ),
+            ));
+        }
+    }
+
+    let name = ident.unraw().to_string();
+    let table = table.unwrap_or_else(|| name.clone());
     Ok(FieldKind::Persisted(Box::new(PersistedField {
         ident,
+        name,
         ty: field.ty.clone(),
         table,
         versions,
     })))
-}
-
-fn current_version(field: &PersistedField) -> u32 {
-    field.versions.len() as u32 + 1
 }
 
 // decodes bytes written at `__version`, then converts step by step up to the current item type
@@ -272,18 +338,19 @@ fn decode_chain(field: &PersistedField) -> TokenStream2 {
     let item = quote! { <#ty as ::endure::__private::Field>::Item };
 
     let arms = field.versions.iter().enumerate().map(|(index, old)| {
-        let version = index as u32 + 1;
+        let number = old.number;
+        let old_ty = &old.ty;
         let steps = field.versions[index + 1..].iter().map(|next| {
-            quote! { let __value: #next = ::core::convert::From::from(__value); }
+            let next_ty = &next.ty;
+            quote! { let __value: #next_ty = ::core::convert::From::from(__value); }
         });
-        let value = Ident::new("__value", Span::call_site());
 
         quote! {
-            #version => {
-                let #value: #old = ::endure::__private::decode(#table, __bytes)?;
+            #number => {
+                let __value: #old_ty = ::endure::__private::decode(#table, __bytes)?;
                 #(#steps)*
-                let #value: #item = ::core::convert::From::from(#value);
-                ::core::result::Result::Ok(#value)
+                let __value: #item = ::core::convert::From::from(__value);
+                ::core::result::Result::Ok(__value)
             }
         }
     });

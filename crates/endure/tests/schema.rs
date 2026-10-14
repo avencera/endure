@@ -16,7 +16,7 @@ mod v1 {
         pub max_parallel: u32,
     }
 
-    #[derive(Durable)]
+    #[derive(Clone, Durable)]
     pub struct App {
         pub approvals: DurableMap<u32, Approval>,
         pub settings: DurableCell<Settings>,
@@ -61,9 +61,9 @@ mod v2 {
         pub theme: String,
     }
 
-    #[derive(Durable)]
+    #[derive(Clone, Durable)]
     pub struct App {
-        #[durable(versions(v1::Approval))]
+        #[durable(versions(v1::Approval = 1))]
         pub approvals: DurableMap<u32, Approval>,
         pub settings: DurableCell<Settings>,
         // renamed from `notes`; the table name keeps the old data
@@ -92,9 +92,9 @@ mod v3 {
         }
     }
 
-    #[derive(Durable)]
+    #[derive(Clone, Durable)]
     pub struct App {
-        #[durable(versions(v1::Approval, v2::Approval))]
+        #[durable(versions(v1::Approval = 1, v2::Approval = 2))]
         pub approvals: DurableMap<u32, Approval>,
     }
 }
@@ -183,6 +183,81 @@ fn older_builds_refuse_newer_files() -> eyre::Result<()> {
     assert!(
         matches!(&result, Err(Error::NewerSchema { table, found: 2, supported: 1 }) if table == "approvals"),
         "got {result:?}"
+    );
+    Ok(())
+}
+
+mod v4 {
+    use super::*;
+
+    // the oldest version was dropped from the list once no stored data needed it
+    #[derive(Clone, Durable)]
+    pub struct App {
+        #[durable(versions(v2::Approval = 2))]
+        pub approvals: DurableMap<u32, v3::Approval>,
+    }
+}
+
+#[test]
+fn data_older_than_the_oldest_listed_version_is_refused() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    write_v1(&dir)?;
+
+    let result = v4::App::builder().path(path(&dir)).open();
+    assert!(
+        matches!(&result, Err(Error::OlderSchema { table, found: 1, oldest: 2 }) if table == "approvals"),
+        "got {result:?}"
+    );
+    Ok(())
+}
+
+mod cells_and_lists {
+    use super::*;
+
+    #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+    pub struct Limits {
+        pub parallel: u64,
+    }
+
+    impl From<v1::Settings> for Limits {
+        fn from(old: v1::Settings) -> Self {
+            Self {
+                parallel: u64::from(old.max_parallel),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct Note {
+        pub text: String,
+    }
+
+    impl From<String> for Note {
+        fn from(text: String) -> Self {
+            Self { text }
+        }
+    }
+
+    #[derive(Clone, Durable)]
+    pub struct App {
+        #[durable(versions(v1::Settings = 1))]
+        pub settings: DurableCell<Limits>,
+        #[durable(versions(String = 1))]
+        pub notes: DurableVec<Note>,
+    }
+}
+
+#[test]
+fn cells_and_lists_upgrade_too() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    write_v1(&dir)?;
+
+    let app = cells_and_lists::App::builder().path(path(&dir)).open()?;
+    let state = app.read();
+    assert_eq!(state.settings.parallel, 3);
+    assert_eq!(
+        state.notes.get(0).map(|note| note.text.as_str()),
+        Some("first")
     );
     Ok(())
 }

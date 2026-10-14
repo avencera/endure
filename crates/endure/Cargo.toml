@@ -10,11 +10,6 @@ readme = "../../README.md"
 keywords = ["persistence", "state", "redb", "actor", "durable"]
 categories = ["database", "data-structures"]
 
-[features]
-default = ["tokio"]
-# offloads commits to tokio's blocking pool when an async update runs inside a runtime
-tokio = ["tokio/rt"]
-
 [dependencies]
 endure-derive.workspace = true
 redb = "4.4"

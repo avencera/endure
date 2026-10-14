@@ -2,37 +2,75 @@ use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 use arc_swap::ArcSwap;
 use redb::{Database, StorageBackend};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{OwnedMutexGuard, oneshot, watch};
 
 use crate::error::{Error, Result, UpdateError};
 use crate::field::{self, Changes, Loader, State};
 
 /// A handle to durable state of type `S`
 ///
-/// Cloning is cheap and every clone shares the same state. Reads return committed snapshots;
-/// writes go through [`update`](Self::update) and friends, which run one at a time in call order
+/// Cloning is cheap and every clone shares the same state. Reads return committed snapshots.
+/// Writes go through [`update`](Self::update) and friends, which take a fair writer lock, so
+/// updates commit in the order they reach it
 pub struct Durable<S: State> {
     inner: Arc<Inner<S>>,
 }
 
 struct Inner<S: State> {
-    db: Database,
+    // only touched while the writer lock is held; `None` once storage could not be reopened
+    db: Mutex<Option<Database>>,
+    // opens the storage again after an I/O error, when the source allows it
+    reopen: Option<Reopen>,
     path: Option<PathBuf>,
     current: ArcSwap<S>,
-    // serializes writers so commits land in the order their updates ran
-    writer: Mutex<()>,
+    writer: Arc<tokio::sync::Mutex<()>>,
     poisoned: AtomicBool,
     commits: watch::Sender<Commit<S>>,
-    hooks: RwLock<Vec<Hook<S>>>,
+    hooks: ArcSwap<Vec<Arc<Hook<S>>>>,
+    // runs async commits; started on the first one
+    jobs: OnceLock<Mutex<mpsc::Sender<Job<S>>>>,
 }
 
-type Hook<S> = Box<dyn Fn(&Commit<S>) + Send + Sync>;
+type Hook<S> = dyn Fn(&Commit<S>) + Send + Sync;
+type Reopen = Box<dyn Fn() -> Result<Database, redb::DatabaseError> + Send + Sync>;
+
+// an async commit handed to the writer thread together with the writer lock, so dropping the
+// caller's future can never separate writing the changes from publishing them
+struct Job<S: State> {
+    inner: Arc<Inner<S>>,
+    _writer: OwnedMutexGuard<()>,
+    next: S,
+    changes: Changes,
+    reply: oneshot::Sender<Result<()>>,
+}
+
+impl<S: State> Job<S> {
+    fn run(self) {
+        let Self {
+            inner,
+            _writer,
+            next,
+            changes,
+            reply,
+        } = self;
+
+        let outcome = catch_unwind(AssertUnwindSafe(|| inner.commit(next, changes)));
+        let result = outcome.unwrap_or_else(|_| {
+            inner.poisoned.store(true, Ordering::Release);
+            Err(Error::Poisoned)
+        });
+
+        // the caller may have stopped waiting; the commit and publish happened regardless
+        let _ = reply.send(result);
+    }
+}
 
 /// A committed, immutable view of the state
 ///
@@ -59,11 +97,11 @@ impl<S: fmt::Debug> fmt::Debug for Snapshot<S> {
     }
 }
 
-/// A notification that an update committed
+/// A notification that the state changed
 pub struct Commit<S> {
     /// The state as of this commit
     pub snapshot: Snapshot<S>,
-    /// Names of the persisted fields the commit changed
+    /// Names of the persisted fields that changed
     pub changed: Arc<[&'static str]>,
 }
 
@@ -77,7 +115,7 @@ impl<S> Clone for Commit<S> {
 }
 
 impl<S> Commit<S> {
-    /// Returns true if the commit changed the named field
+    /// Returns true if the named field changed
     pub fn changed(&self, field: &str) -> bool {
         self.changed.contains(&field)
     }
@@ -121,27 +159,6 @@ impl<S: State> Durable<S> {
             .expect("opening an empty in-memory database cannot fail")
     }
 
-    fn from_db(db: Database, path: Option<PathBuf>) -> Result<Self> {
-        let state = load::<S>(&db)?;
-        let snapshot = Snapshot(Arc::new(state));
-        let (commits, _) = watch::channel(Commit {
-            snapshot: snapshot.clone(),
-            changed: Arc::from([]),
-        });
-
-        Ok(Self {
-            inner: Arc::new(Inner {
-                db,
-                path,
-                current: ArcSwap::new(snapshot.0),
-                writer: Mutex::new(()),
-                poisoned: AtomicBool::new(false),
-                commits,
-                hooks: RwLock::new(Vec::new()),
-            }),
-        })
-    }
-
     /// Returns the latest committed snapshot
     ///
     /// This is a cheap pointer load with no I/O
@@ -154,10 +171,21 @@ impl<S: State> Durable<S> {
         self.inner.path.as_deref()
     }
 
+    /// Returns true if a failed commit left the handle unable to reload its state
+    ///
+    /// A poisoned handle refuses updates and its reads may be stale. Drop every handle and open
+    /// the state again
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.poisoned.load(Ordering::Acquire)
+    }
+
     /// Applies `f` to a copy of the state and commits the changes it made
     ///
-    /// The returned future resolves once the changes are durable. Other readers see them only
-    /// after that point. If the commit fails, the state stays as it was
+    /// Resolves once the changes are durable, and nobody else sees them before that. Once `f`
+    /// has run, dropping the future does not cancel the commit
+    ///
+    /// On [`Error::CommitFailed`] the changes may or may not have been saved; the handle reloads
+    /// from storage, so [`read`](Self::read) shows which
     pub async fn update<T>(&self, f: impl FnOnce(&mut S) -> T) -> Result<T> {
         self.try_update(|state| Ok::<_, Infallible>(f(state)))
             .await
@@ -172,16 +200,28 @@ impl<S: State> Durable<S> {
         &self,
         f: impl FnOnce(&mut S) -> Result<T, E>,
     ) -> Result<T, UpdateError<E>> {
-        let _writer = self.inner.writer.lock().await;
-        let (output, next, changes) = self.prepare(f)?;
+        let writer = Arc::clone(&self.inner.writer).lock_owned().await;
+        let (output, next, changes) = self.inner.prepare(f)?;
 
-        let (changes, result) = if changes.is_empty() {
-            (changes, Ok(()))
-        } else {
-            commit_async(Arc::clone(&self.inner), changes).await
-        };
+        if changes.is_empty() {
+            self.inner.publish(next, Vec::new());
+            return Ok(output);
+        }
 
-        self.finish(next, changes, result)?;
+        let (reply, done) = oneshot::channel();
+        self.inner.submit(Job {
+            inner: Arc::clone(&self.inner),
+            _writer: writer,
+            next,
+            changes,
+            reply,
+        });
+
+        match done.await {
+            Ok(result) => result.map_err(UpdateError::Storage)?,
+            Err(_) => return Err(UpdateError::Storage(Error::Poisoned)),
+        }
+
         Ok(output)
     }
 
@@ -189,7 +229,8 @@ impl<S: State> Durable<S> {
     ///
     /// # Panics
     ///
-    /// Panics if called from within an async runtime; use [`update`](Self::update) there
+    /// Panics if called from within an async runtime; use [`update`](Self::update) there, or
+    /// call this from `spawn_blocking`
     pub fn update_blocking<T>(&self, f: impl FnOnce(&mut S) -> T) -> Result<T> {
         self.try_update_blocking(|state| Ok::<_, Infallible>(f(state)))
             .map_err(storage_error)
@@ -199,41 +240,38 @@ impl<S: State> Durable<S> {
     ///
     /// # Panics
     ///
-    /// Panics if called from within an async runtime; use [`try_update`](Self::try_update) there
+    /// Panics if called from within an async runtime; use [`try_update`](Self::try_update)
+    /// there, or call this from `spawn_blocking`
     pub fn try_update_blocking<T, E>(
         &self,
         f: impl FnOnce(&mut S) -> Result<T, E>,
     ) -> Result<T, UpdateError<E>> {
         let _writer = self.inner.writer.blocking_lock();
-        let (output, next, changes) = self.prepare(f)?;
-
-        let result = if changes.is_empty() {
-            Ok(())
-        } else {
-            write(&self.inner.db, &changes)
-        };
-
-        self.finish(next, changes, result)?;
+        let (output, next, changes) = self.inner.prepare(f)?;
+        self.inner.commit(next, changes)?;
         Ok(output)
     }
 
-    /// Subscribes to commits; the receiver always holds the most recent one
+    /// Subscribes to changes; the receiver always holds the most recent one
     ///
     /// Use this to refresh a UI or wake a task when state changes
     pub fn subscribe(&self) -> watch::Receiver<Commit<S>> {
         self.inner.commits.subscribe()
     }
 
-    /// Runs `hook` synchronously after every commit, in commit order
+    /// Runs `hook` synchronously after every change, in commit order
     ///
-    /// Hooks run while the writer lock is held, so keep them short and never call `update`
-    /// from inside one
+    /// Hooks run while the writer lock is held, so keep them short and never call `update` from
+    /// one. A hook that panics is skipped for that commit; the commit itself still succeeds.
+    /// A hook that captures a clone of this handle keeps the state open until the process exits,
+    /// so use [`subscribe`](Self::subscribe) when the reaction needs the handle
     pub fn on_commit(&self, hook: impl Fn(&Commit<S>) + Send + Sync + 'static) {
-        self.inner
-            .hooks
-            .write()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .push(Box::new(hook));
+        let hook: Arc<Hook<S>> = Arc::new(hook);
+        self.inner.hooks.rcu(|hooks| {
+            let mut hooks = Vec::clone(hooks);
+            hooks.push(Arc::clone(&hook));
+            hooks
+        });
     }
 
     /// Closes the state and deletes its file
@@ -251,16 +289,41 @@ impl<S: State> Durable<S> {
         Ok(())
     }
 
+    fn from_db(db: Database, path: Option<PathBuf>, reopen: Option<Reopen>) -> Result<Self> {
+        let state = load::<S>(&db, None)?;
+        let snapshot = Snapshot(Arc::new(state));
+        let (commits, _) = watch::channel(Commit {
+            snapshot: snapshot.clone(),
+            changed: Arc::from([]),
+        });
+
+        Ok(Self {
+            inner: Arc::new(Inner {
+                db: Mutex::new(Some(db)),
+                reopen,
+                path,
+                current: ArcSwap::new(snapshot.0),
+                writer: Arc::new(tokio::sync::Mutex::new(())),
+                poisoned: AtomicBool::new(false),
+                commits,
+                hooks: ArcSwap::from_pointee(Vec::new()),
+                jobs: OnceLock::new(),
+            }),
+        })
+    }
+}
+
+impl<S: State> Inner<S> {
     fn prepare<T, E>(
         &self,
         f: impl FnOnce(&mut S) -> Result<T, E>,
     ) -> Result<(T, S, Changes), UpdateError<E>> {
-        if self.inner.poisoned.load(Ordering::Acquire) {
+        if self.poisoned.load(Ordering::Acquire) {
             return Err(UpdateError::Storage(Error::Poisoned));
         }
 
         // the maps and lists inside are structurally shared, so this copy is cheap
-        let mut next = S::clone(&self.inner.current.load());
+        let mut next = S::clone(&self.current.load());
         let output = f(&mut next).map_err(UpdateError::Rejected)?;
 
         let mut changes = Changes::default();
@@ -268,55 +331,116 @@ impl<S: State> Durable<S> {
         Ok((output, next, changes))
     }
 
-    fn finish(&self, next: S, changes: Changes, result: Result<()>) -> Result<()> {
-        if let Err(error) = result {
-            self.recover();
-            return Err(error);
+    // writes the changes and publishes the new state; the caller holds the writer lock
+    fn commit(&self, next: S, changes: Changes) -> Result<()> {
+        if changes.is_empty() {
+            self.publish(next, Vec::new());
+            return Ok(());
         }
 
-        let snapshot = Snapshot(Arc::new(next));
-        self.inner.current.store(Arc::clone(&snapshot.0));
+        match self.write(&changes) {
+            Ok(()) => {
+                self.publish(next, changes.fields);
+                Ok(())
+            }
+            Err(error) => {
+                self.recover();
+                Err(Error::CommitFailed(Box::new(error)))
+            }
+        }
+    }
 
-        if !changes.is_empty() {
-            self.notify(Commit {
-                snapshot,
-                changed: Arc::from(changes.fields),
-            });
+    fn write(&self, changes: &Changes) -> Result<()> {
+        let db = self.db.lock().unwrap_or_else(|poison| poison.into_inner());
+        let db = db.as_ref().ok_or(Error::Poisoned)?;
+
+        let txn = db.begin_write()?;
+        for (name, ops) in &changes.tables {
+            let mut table = txn.open_table(field::table(name))?;
+            field::apply(&mut table, ops)?;
         }
 
+        txn.commit()?;
         Ok(())
     }
 
-    // a failed commit may or may not have reached disk, so reload rather than guess; if even
-    // that fails, refuse further writes until the state is reopened
+    // a failed commit may or may not have reached storage, so reload instead of guessing
     fn recover(&self) {
-        match load::<S>(&self.inner.db) {
-            Ok(state) => {
-                let snapshot = Snapshot(Arc::new(state));
-                self.inner.current.store(Arc::clone(&snapshot.0));
-                let changed: Vec<&'static str> =
-                    S::fields().iter().map(|field| field.name).collect();
-                self.notify(Commit {
-                    snapshot,
-                    changed: Arc::from(changed),
-                });
+        let mut slot = self.db.lock().unwrap_or_else(|poison| poison.into_inner());
+        let previous = self.current.load_full();
+
+        if let Some(db) = slot.as_ref()
+            && let Ok(state) = load::<S>(db, Some(&previous))
+        {
+            self.publish_reload(state);
+            return;
+        }
+
+        // redb refuses all further work after an I/O error, so open the storage again; the old
+        // handle is dropped first to release its file lock
+        if let Some(reopen) = &self.reopen {
+            *slot = None;
+
+            let reopened = reopen()
+                .map_err(Error::from)
+                .and_then(|db| load::<S>(&db, Some(&previous)).map(|state| (db, state)));
+
+            if let Ok((db, state)) = reopened {
+                *slot = Some(db);
+                self.publish_reload(state);
+                return;
             }
-            Err(_) => self.inner.poisoned.store(true, Ordering::Release),
+        }
+
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    fn publish_reload(&self, state: S) {
+        let changed = S::fields().iter().map(|field| field.name).collect();
+        self.publish(state, changed);
+    }
+
+    fn publish(&self, state: S, changed: Vec<&'static str>) {
+        let snapshot = Snapshot(Arc::new(state));
+        self.current.store(Arc::clone(&snapshot.0));
+
+        if changed.is_empty() {
+            return;
+        }
+
+        let commit = Commit {
+            snapshot,
+            changed: Arc::from(changed),
+        };
+
+        // subscribers first, so a misbehaving hook can never hide a commit from them
+        self.commits.send_replace(commit.clone());
+
+        for hook in self.hooks.load().iter() {
+            let _ = catch_unwind(AssertUnwindSafe(|| hook(&commit)));
         }
     }
 
-    fn notify(&self, commit: Commit<S>) {
-        for hook in self
-            .inner
-            .hooks
-            .read()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .iter()
-        {
-            hook(&commit);
-        }
+    fn submit(&self, job: Job<S>) {
+        let sender = self.jobs.get_or_init(|| {
+            let (sender, receiver) = mpsc::channel::<Job<S>>();
+            std::thread::Builder::new()
+                .name(format!("endure-writer-{}", S::NAME))
+                .spawn(move || {
+                    for job in receiver {
+                        job.run();
+                    }
+                })
+                .expect("spawn endure writer thread");
 
-        self.inner.commits.send_replace(commit);
+            Mutex::new(sender)
+        });
+
+        let sender = sender.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Err(mpsc::SendError(job)) = sender.send(job) {
+            // the writer thread is gone, so commit here rather than lose the update
+            job.run();
+        }
     }
 }
 
@@ -327,57 +451,25 @@ fn storage_error(error: UpdateError<Infallible>) -> Error {
     }
 }
 
-fn load<S: State>(db: &Database) -> Result<S> {
+fn load<S: State>(db: &Database, previous: Option<&S>) -> Result<S> {
     let txn = db.begin_write()?;
     let state = {
         let mut loader = Loader::new(&txn)?;
-        S::load(&mut loader)?
+        S::load(&mut loader, previous)?
     };
 
     txn.commit()?;
     Ok(state)
 }
 
-fn write(db: &Database, changes: &Changes) -> Result<()> {
-    let txn = db.begin_write()?;
-    for (name, ops) in &changes.tables {
-        let mut table = txn.open_table(field::table(name))?;
-        field::apply(&mut table, ops)?;
-    }
+type OpenOnce = Box<dyn FnOnce(&redb::Builder) -> Result<Database, redb::DatabaseError>>;
 
-    txn.commit()?;
-    Ok(())
+enum Source {
+    Default,
+    Path(PathBuf),
+    Backend(OpenOnce),
+    BackendWith(Arc<dyn Fn() -> Result<Database, redb::DatabaseError> + Send + Sync>),
 }
-
-#[cfg(feature = "tokio")]
-async fn commit_async<S: State>(inner: Arc<Inner<S>>, changes: Changes) -> (Changes, Result<()>) {
-    // keep the fsync off the async worker threads when a runtime is available
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            let task = handle.spawn_blocking(move || {
-                let result = write(&inner.db, &changes);
-                (changes, result)
-            });
-
-            match task.await {
-                Ok(outcome) => outcome,
-                Err(error) => std::panic::resume_unwind(error.into_panic()),
-            }
-        }
-        Err(_) => {
-            let result = write(&inner.db, &changes);
-            (changes, result)
-        }
-    }
-}
-
-#[cfg(not(feature = "tokio"))]
-async fn commit_async<S: State>(inner: Arc<Inner<S>>, changes: Changes) -> (Changes, Result<()>) {
-    let result = write(&inner.db, &changes);
-    (changes, result)
-}
-
-type OpenBackend = Box<dyn FnOnce(&redb::Builder) -> Result<Database, redb::DatabaseError>>;
 
 /// Configures where durable state is stored
 ///
@@ -387,8 +479,7 @@ type OpenBackend = Box<dyn FnOnce(&redb::Builder) -> Result<Database, redb::Data
 pub struct Builder<S> {
     dir: Option<PathBuf>,
     name: Option<String>,
-    path: Option<PathBuf>,
-    backend: Option<OpenBackend>,
+    source: Source,
     _state: PhantomData<fn() -> S>,
 }
 
@@ -397,8 +488,7 @@ impl<S: State> Builder<S> {
         Self {
             dir: None,
             name: None,
-            path: None,
-            backend: None,
+            source: Source::Default,
             _state: PhantomData,
         }
     }
@@ -417,14 +507,29 @@ impl<S: State> Builder<S> {
 
     /// Uses exactly this file path, ignoring `dir` and `name`
     pub fn path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.path = Some(path.into());
+        self.source = Source::Path(path.into());
         self
     }
 
     /// Stores the state through a custom redb storage backend, such as an encrypting one
+    ///
+    /// The backend is used once, so after an I/O error the handle cannot reopen it and becomes
+    /// poisoned. Use [`backend_with`](Self::backend_with) to allow recovery
     pub fn backend(mut self, backend: impl StorageBackend) -> Self {
-        self.backend = Some(Box::new(move |builder| {
+        self.source = Source::Backend(Box::new(move |builder| {
             builder.create_with_backend(backend)
+        }));
+        self
+    }
+
+    /// Stores the state through custom backends made by `make`, which is called again to reopen
+    /// the storage after an I/O error
+    pub fn backend_with<B: StorageBackend>(
+        mut self,
+        make: impl Fn() -> B + Send + Sync + 'static,
+    ) -> Self {
+        self.source = Source::BackendWith(Arc::new(move || {
+            Database::builder().create_with_backend(make())
         }));
         self
     }
@@ -436,41 +541,48 @@ impl<S: State> Builder<S> {
 
     /// Returns the file path this builder would open, or `None` for a custom backend
     pub fn resolved_path(&self) -> Result<Option<PathBuf>> {
-        if self.backend.is_some() {
-            return Ok(None);
+        match &self.source {
+            Source::Path(path) => Ok(Some(path.clone())),
+            Source::Backend(_) | Source::BackendWith(_) => Ok(None),
+            Source::Default => {
+                let dir = match &self.dir {
+                    Some(dir) => dir.clone(),
+                    None => default_dir()?.join(S::APP),
+                };
+
+                let name = self.name.as_deref().unwrap_or(S::NAME);
+                Ok(Some(dir.join(format!("{name}.redb"))))
+            }
         }
-
-        if let Some(path) = &self.path {
-            return Ok(Some(path.clone()));
-        }
-
-        let dir = match &self.dir {
-            Some(dir) => dir.clone(),
-            None => default_dir()?.join(S::APP),
-        };
-
-        let name = self.name.as_deref().unwrap_or(S::NAME);
-        Ok(Some(dir.join(format!("{name}.redb"))))
     }
 
     /// Opens the state, creating the file and its directory if needed
     pub fn open(self) -> Result<Durable<S>> {
         let path = self.resolved_path()?;
-        let builder = Database::builder();
 
-        let db = match (self.backend, &path) {
-            (Some(open), _) => open(&builder)?,
-            (None, Some(path)) => {
-                if let Some(parent) = path.parent() {
+        match self.source {
+            Source::Backend(open) => Durable::from_db(open(&Database::builder())?, None, None),
+            Source::BackendWith(open) => {
+                let db = open()?;
+                Durable::from_db(db, None, Some(Box::new(move || open())))
+            }
+            Source::Default | Source::Path(_) => {
+                let path = path.expect("file sources always resolve a path");
+                if let Some(parent) = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
                     create_private_dir(parent)?;
                 }
 
-                builder.create(path)?
-            }
-            (None, None) => unreachable!("a builder without a backend always resolves a path"),
-        };
+                create_private_file(&path)?;
+                let db = Database::create(&path)?;
 
-        Durable::from_db(db, path)
+                let reopen_path = path.clone();
+                let reopen: Reopen = Box::new(move || Database::create(&reopen_path));
+                Durable::from_db(db, Some(path), Some(reopen))
+            }
+        }
     }
 }
 
@@ -494,4 +606,26 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // create the file owner-only before redb opens it; an existing file keeps its mode
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_file(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }

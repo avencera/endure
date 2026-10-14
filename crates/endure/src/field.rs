@@ -1,4 +1,4 @@
-//! The contract between `#[derive(Durable)]` and the collection types
+//! The contract between `#[derive(Clone, Durable)]` and the collection types
 //!
 //! Everything here is public only so generated code can reach it. It is not a stable API
 
@@ -43,7 +43,7 @@ pub struct FieldSpec {
     pub version: u32,
 }
 
-/// A struct whose fields persist, implemented by `#[derive(Durable)]`
+/// A struct whose fields persist, implemented by `#[derive(Clone, Durable)]`
 pub trait State: Clone + Send + Sync + Sized + 'static {
     /// Default file stem, the struct name in snake case
     const NAME: &'static str;
@@ -54,7 +54,9 @@ pub trait State: Clone + Send + Sync + Sized + 'static {
     fn fields() -> &'static [FieldSpec];
 
     /// Builds the state from storage
-    fn load(loader: &mut Loader<'_>) -> Result<Self>;
+    ///
+    /// Memory-only fields are copied from `previous` when reloading, or start as their default
+    fn load(loader: &mut Loader<'_>, previous: Option<&Self>) -> Result<Self>;
 
     /// Moves every field's pending changes into `changes`
     fn take_changes(&mut self, changes: &mut Changes) -> Result<()>;
@@ -89,6 +91,15 @@ impl Changes {
     pub(crate) fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
+}
+
+/// The schema versions one field can read
+#[derive(Debug, Clone, Copy)]
+pub struct Versions {
+    /// The oldest stored version that can still be upgraded
+    pub oldest: u32,
+    /// The version new values are written at
+    pub current: u32,
 }
 
 const META: TableDefinition<&str, u32> = TableDefinition::new("__endure_meta");
@@ -128,12 +139,12 @@ impl<'txn> Loader<'txn> {
 
     /// Loads one field, decoding each stored value with `decode(stored_version, bytes)`
     ///
-    /// When the stored version is older than `version`, every value is decoded through the
-    /// upgrade path and rewritten at the current version in the same transaction
+    /// When the stored version is older than `versions.current`, every value is decoded through
+    /// the upgrade path and rewritten at the current version in the same transaction
     pub fn field<F: Field>(
         &mut self,
         table_name: &'static str,
-        version: u32,
+        versions: Versions,
         decode: impl Fn(u32, &[u8]) -> Result<F::Item>,
     ) -> Result<F> {
         let mut table = self.txn.open_table(table(table_name))?;
@@ -148,27 +159,36 @@ impl<'txn> Loader<'txn> {
             Some(stored) => stored,
             // rows without a recorded version predate versioning, so they are version 1
             None if !rows.is_empty() => 1,
-            None => version,
+            // an empty table has nothing to upgrade, so it starts at the current version
+            None => versions.current,
         };
 
-        if stored > version {
+        if stored > versions.current {
             return Err(Error::NewerSchema {
                 table: table_name.to_owned(),
                 found: stored,
-                supported: version,
+                supported: versions.current,
+            });
+        }
+
+        if stored < versions.oldest && !rows.is_empty() {
+            return Err(Error::OlderSchema {
+                table: table_name.to_owned(),
+                found: stored,
+                oldest: versions.oldest,
             });
         }
 
         let mut field = F::load(table_name, rows, &|bytes| decode(stored, bytes))?;
 
-        if stored < version {
+        if stored < versions.current {
             field.mark_all_changed();
             let mut ops = Vec::new();
             field.take_ops(table_name, &mut ops)?;
             apply(&mut table, &ops)?;
         }
 
-        meta.insert(table_name, version)?;
+        meta.insert(table_name, versions.current)?;
         Ok(field)
     }
 }

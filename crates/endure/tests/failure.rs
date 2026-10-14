@@ -2,23 +2,64 @@
 
 use std::fs::OpenOptions;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use endure::redb::StorageBackend;
 use endure::redb::backends::FileBackend;
-use endure::{Durable, DurableMap, Error, UpdateError};
+use endure::{Durable, DurableMap, Error};
 use tempfile::TempDir;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Fail {
+    Write,
+    Sync,
+}
+
+// fails the next `remaining` calls of one kind, then behaves normally
+#[derive(Debug, Clone)]
+struct Faults {
+    kind: Fail,
+    remaining: Arc<AtomicUsize>,
+}
+
+impl Faults {
+    fn new(kind: Fail) -> Self {
+        Self {
+            kind,
+            remaining: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn fail_next(&self, count: usize) {
+        self.remaining.store(count, Ordering::SeqCst);
+    }
+
+    fn check(&self, kind: Fail) -> io::Result<()> {
+        if kind == self.kind
+            && self
+                .remaining
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Err(io::Error::other("injected failure"));
+        }
+
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 struct FlakyBackend {
     inner: FileBackend,
-    fail_writes: Arc<AtomicBool>,
+    faults: Faults,
 }
 
 impl FlakyBackend {
-    fn open(path: &Path, fail_writes: Arc<AtomicBool>) -> Self {
+    fn open(path: &Path, faults: Faults) -> Self {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -26,18 +67,11 @@ impl FlakyBackend {
             .truncate(false)
             .open(path)
             .unwrap();
+
         Self {
             inner: FileBackend::new(file).unwrap(),
-            fail_writes,
+            faults,
         }
-    }
-
-    fn check(&self) -> io::Result<()> {
-        if self.fail_writes.load(Ordering::SeqCst) {
-            return Err(io::Error::other("injected write failure"));
-        }
-
-        Ok(())
     }
 }
 
@@ -51,17 +85,17 @@ impl StorageBackend for FlakyBackend {
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
-        self.check()?;
+        self.faults.check(Fail::Write)?;
         self.inner.set_len(len)
     }
 
     fn sync_data(&self) -> io::Result<()> {
-        self.check()?;
+        self.faults.check(Fail::Sync)?;
         self.inner.sync_data()
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.check()?;
+        self.faults.check(Fail::Write)?;
         self.inner.write(offset, data)
     }
 
@@ -70,68 +104,97 @@ impl StorageBackend for FlakyBackend {
     }
 }
 
-#[derive(Durable)]
+#[derive(Clone, Durable)]
 struct Store {
     entries: DurableMap<u32, String>,
+    #[durable(skip)]
+    cache: Vec<u32>,
 }
 
-fn open(path: &Path, fail_writes: &Arc<AtomicBool>) -> Durable<Store> {
+fn reopenable(path: &Path, faults: &Faults) -> Durable<Store> {
+    let path = path.to_path_buf();
+    let faults = faults.clone();
     Store::builder()
-        .backend(FlakyBackend::open(path, Arc::clone(fail_writes)))
+        .backend_with(move || FlakyBackend::open(&path, faults.clone()))
         .open()
         .unwrap()
 }
 
-#[test]
-fn failed_commit_leaves_memory_and_disk_in_agreement() -> eyre::Result<()> {
+fn keys(store: &Durable<Store>) -> Vec<u32> {
+    store.read().entries.keys().copied().collect()
+}
+
+fn keys_on_disk(path: &PathBuf) -> Vec<u32> {
+    let store = Store::builder().path(path).open().unwrap();
+    keys(&store)
+}
+
+fn failed_commit_recovers(kind: Fail) -> eyre::Result<()> {
     let dir = TempDir::new()?;
     let path = dir.path().join("flaky.redb");
-    let fail_writes = Arc::new(AtomicBool::new(false));
+    let faults = Faults::new(kind);
 
-    let store = open(&path, &fail_writes);
-    store.update_blocking(|s| s.entries.insert(1, "kept".into()))?;
+    let store = reopenable(&path, &faults);
+    store.update_blocking(|s| {
+        s.entries.insert(1, "kept".into());
+        s.cache.push(7);
+    })?;
 
-    fail_writes.store(true, Ordering::SeqCst);
-    let result = store.try_update_blocking(|s| {
-        s.entries.insert(2, "lost".into());
-        Ok::<_, std::convert::Infallible>(())
-    });
+    faults.fail_next(1);
+    let result = store.update_blocking(|s| s.entries.insert(2, "maybe".into()));
     assert!(
-        matches!(result, Err(UpdateError::Storage(_))),
+        matches!(result, Err(Error::CommitFailed(_))),
         "got {result:?}"
     );
 
-    // memory never shows the write that failed
-    assert_eq!(
-        store.read().entries.keys().copied().collect::<Vec<_>>(),
-        [1]
-    );
+    // the handle reopened its storage instead of giving up, and kept memory-only fields
+    assert!(!store.is_poisoned());
+    assert_eq!(store.read().cache, vec![7]);
 
-    // once storage recovers the handle either keeps working or asks to be reopened, never
-    // silently diverging from disk
-    fail_writes.store(false, Ordering::SeqCst);
-    match store.update_blocking(|s| s.entries.insert(3, "after".into())) {
-        Ok(_) => assert_eq!(
-            store.read().entries.keys().copied().collect::<Vec<_>>(),
-            [1, 3]
-        ),
-        Err(Error::Poisoned) => {}
-        Err(other) => panic!("unexpected error after recovery: {other:?}"),
-    }
-
-    let expected: Vec<u32> = store.read().entries.keys().copied().collect();
+    store.update_blocking(|s| s.entries.insert(3, "after".into()))?;
+    let in_memory = keys(&store);
     drop(store);
 
-    let reopened = open(&path, &fail_writes);
-    let on_disk: Vec<u32> = reopened.read().entries.keys().copied().collect();
+    assert_eq!(in_memory, keys_on_disk(&path), "memory must match disk");
+    assert!(in_memory.contains(&1) && in_memory.contains(&3));
+    Ok(())
+}
+
+#[test]
+fn failed_write_recovers_with_memory_matching_disk() -> eyre::Result<()> {
+    failed_commit_recovers(Fail::Write)
+}
+
+#[test]
+fn failed_sync_recovers_with_memory_matching_disk() -> eyre::Result<()> {
+    failed_commit_recovers(Fail::Sync)
+}
+
+#[test]
+fn single_use_backend_poisons_after_a_failed_commit() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("flaky.redb");
+    let faults = Faults::new(Fail::Write);
+
+    let store = Store::builder()
+        .backend(FlakyBackend::open(&path, faults.clone()))
+        .open()?;
+    store.update_blocking(|s| s.entries.insert(1, "kept".into()))?;
+
+    faults.fail_next(usize::MAX);
+    let result = store.update_blocking(|s| s.entries.insert(2, "lost".into()));
     assert!(
-        !on_disk.contains(&2),
-        "a failed commit must not appear after reopening"
+        matches!(result, Err(Error::CommitFailed(_))),
+        "got {result:?}"
     );
-    assert!(on_disk.contains(&1));
-    assert!(
-        on_disk == expected || on_disk == [1],
-        "disk {on_disk:?}, memory had {expected:?}"
-    );
+    assert!(store.is_poisoned());
+
+    faults.fail_next(0);
+    let next = store.update_blocking(|s| s.entries.insert(3, "refused".into()));
+    assert!(matches!(next, Err(Error::Poisoned)), "got {next:?}");
+    assert_eq!(keys(&store), [1]);
+
+    drop(store);
+    assert_eq!(keys_on_disk(&path), [1]);
     Ok(())
 }

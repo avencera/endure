@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Index;
 
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
 use crate::error::{Error, Result};
@@ -23,8 +23,10 @@ pub struct DurableVec<T> {
     items: imbl::Vector<T>,
     // order key of each element, strictly increasing, parallel to `items`
     keys: imbl::Vector<u64>,
-    // order keys touched since the last commit; present keys are written, absent ones deleted
-    dirty: BTreeSet<u64>,
+    // order keys touched since the last commit, each with whether it was stored before the
+    // update; present keys are written, absent ones deleted, and keys that were never stored
+    // and are gone again need no write
+    dirty: BTreeMap<u64, bool>,
 }
 
 impl<T: Clone> DurableVec<T> {
@@ -33,7 +35,7 @@ impl<T: Clone> DurableVec<T> {
         Self {
             items: imbl::Vector::new(),
             keys: imbl::Vector::new(),
-            dirty: BTreeSet::new(),
+            dirty: BTreeMap::new(),
         }
     }
 
@@ -65,7 +67,7 @@ impl<T: Clone> DurableVec<T> {
     /// Returns a mutable reference to the element at `index`, marking it changed
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         let key = *self.keys.get(index)?;
-        self.dirty.insert(key);
+        self.touch(key, true);
         self.items.get_mut(index)
     }
 
@@ -80,9 +82,9 @@ impl<T: Clone> DurableVec<T> {
             }
         };
 
+        self.touch(key, false);
         self.keys.push_back(key);
         self.items.push_back(value);
-        self.dirty.insert(key);
     }
 
     /// Prepends an element
@@ -93,14 +95,14 @@ impl<T: Clone> DurableVec<T> {
     /// Removes and returns the last element
     pub fn pop(&mut self) -> Option<T> {
         let key = self.keys.pop_back()?;
-        self.dirty.insert(key);
+        self.touch(key, true);
         self.items.pop_back()
     }
 
     /// Removes and returns the first element
     pub fn pop_front(&mut self) -> Option<T> {
         let key = self.keys.pop_front()?;
-        self.dirty.insert(key);
+        self.touch(key, true);
         self.items.pop_front()
     }
 
@@ -130,9 +132,9 @@ impl<T: Clone> DurableVec<T> {
             }
         };
 
+        self.touch(key, false);
         self.keys.insert(index, key);
         self.items.insert(index, value);
-        self.dirty.insert(key);
     }
 
     /// Removes and returns the element at `index`, shifting later elements left
@@ -142,7 +144,7 @@ impl<T: Clone> DurableVec<T> {
     /// Panics if `index >= len`
     pub fn remove(&mut self, index: usize) -> T {
         let key = self.keys.remove(index);
-        self.dirty.insert(key);
+        self.touch(key, true);
         self.items.remove(index)
     }
 
@@ -152,7 +154,11 @@ impl<T: Clone> DurableVec<T> {
             return;
         }
 
-        self.dirty.extend(self.keys.iter().skip(len).copied());
+        let removed: Vec<u64> = self.keys.iter().skip(len).copied().collect();
+        for key in removed {
+            self.touch(key, true);
+        }
+
         self.keys.truncate(len);
         self.items.truncate(len);
     }
@@ -176,7 +182,7 @@ impl<T: Clone> DurableVec<T> {
 
     /// Calls `f` on every element with mutable access, marking every element changed
     pub fn for_each_mut(&mut self, mut f: impl FnMut(&mut T)) {
-        self.dirty.extend(self.keys.iter().copied());
+        self.touch_all();
         for item in self.items.iter_mut() {
             f(item);
         }
@@ -185,7 +191,7 @@ impl<T: Clone> DurableVec<T> {
     /// Sorts the list with a comparator, rewriting every element
     pub fn sort_by(&mut self, compare: impl Fn(&T, &T) -> Ordering) {
         self.items.sort_by(compare);
-        self.dirty.extend(self.keys.iter().copied());
+        self.touch_all();
     }
 
     /// Sorts the list, rewriting every element
@@ -214,11 +220,28 @@ impl<T: Clone> DurableVec<T> {
 
     // spreads the keys evenly again once a gap has run out
     fn renumber(&mut self) {
-        self.dirty.extend(self.keys.iter().copied());
+        self.touch_all();
         self.keys = (0..self.items.len() as u64)
             .map(|position| BASE + position * STEP)
             .collect();
-        self.dirty.extend(self.keys.iter().copied());
+
+        // a new key equal to an old one was already touched as stored, so this keeps it
+        let fresh: Vec<u64> = self.keys.iter().copied().collect();
+        for key in fresh {
+            self.touch(key, false);
+        }
+    }
+
+    fn touch_all(&mut self) {
+        let keys: Vec<u64> = self.keys.iter().copied().collect();
+        for key in keys {
+            self.touch(key, true);
+        }
+    }
+
+    // a key's first touch in an update records whether it was stored before the update
+    fn touch(&mut self, key: u64, stored: bool) {
+        self.dirty.entry(key).or_insert(stored);
     }
 }
 
@@ -279,7 +302,7 @@ impl<T: Clone> Extend<T> for DurableVec<T> {
 
 impl<T> Field for DurableVec<T>
 where
-    T: Clone + Serialize + Send + Sync + 'static,
+    T: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     type Item = T;
 
@@ -304,13 +327,15 @@ where
     }
 
     fn mark_all_changed(&mut self) {
-        self.dirty.extend(self.keys.iter().copied());
+        self.touch_all();
     }
 
     fn take_ops(&mut self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
-        for key in std::mem::take(&mut self.dirty) {
+        for (key, was_stored) in std::mem::take(&mut self.dirty) {
             let value = match self.keys.binary_search(&key) {
-                Ok(index) => Some(codec::encode(table, &self.items[index])?),
+                Ok(index) => Some(codec::encode_checked(table, &self.items[index])?),
+                // pushed and removed within one update, so storage never saw it
+                Err(_) if !was_stored => continue,
                 Err(_) => None,
             };
 

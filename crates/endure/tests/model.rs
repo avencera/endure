@@ -7,7 +7,7 @@ use endure::{Durable, DurableMap, DurableVec};
 use proptest::prelude::*;
 use tempfile::TempDir;
 
-#[derive(Durable)]
+#[derive(Clone, Durable)]
 struct Model {
     list: DurableVec<u32>,
     map: DurableMap<u16, u32>,

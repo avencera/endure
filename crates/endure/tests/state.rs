@@ -17,7 +17,7 @@ struct Task {
     done: bool,
 }
 
-#[derive(Durable)]
+#[derive(Clone, Durable)]
 struct App {
     tasks: DurableMap<u64, Task>,
     settings: DurableCell<Settings>,
@@ -147,7 +147,7 @@ fn panicking_update_changes_nothing() -> eyre::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_updates_apply_in_order() -> eyre::Result<()> {
-    #[derive(Durable)]
+    #[derive(Clone, Durable)]
     struct Counter {
         count: DurableCell<u64>,
         log: DurableVec<u64>,
@@ -329,5 +329,224 @@ fn map_range_and_order() -> eyre::Result<()> {
     );
     assert_eq!(state.tasks.first().map(|(id, _)| *id), Some(1));
     assert_eq!(state.tasks.last().map(|(id, _)| *id), Some(9));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_update_still_commits_and_publishes() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let app = open_at(&dir);
+
+    {
+        // poll once so the commit is queued, then drop the future
+        let update = app.update(|s| {
+            s.tasks.insert(
+                1,
+                Task {
+                    name: "cancelled caller".into(),
+                    done: false,
+                },
+            );
+        });
+        tokio::pin!(update);
+        let _ = futures_poll_once(update.as_mut()).await;
+    }
+
+    app.update(|s| {
+        s.tasks.insert(
+            2,
+            Task {
+                name: "next".into(),
+                done: false,
+            },
+        );
+    })
+    .await?;
+
+    let in_memory: Vec<u64> = app.read().tasks.keys().copied().collect();
+    drop(app);
+
+    let on_disk: Vec<u64> = open_at(&dir).read().tasks.keys().copied().collect();
+    assert_eq!(
+        in_memory, on_disk,
+        "memory and disk must agree after a cancelled update"
+    );
+    assert!(on_disk.contains(&2));
+    Ok(())
+}
+
+// polls a future exactly once and reports whether it finished
+async fn futures_poll_once<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> bool {
+    let mut future = Some(future);
+    std::future::poll_fn(move |cx| {
+        let finished = future.take().expect("polled once").poll(cx).is_ready();
+        std::task::Poll::Ready(finished)
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_panicking_hook_does_not_fail_the_commit() -> eyre::Result<()> {
+    let app = App::memory();
+    let later_hook_ran = Arc::new(Mutex::new(0));
+
+    app.on_commit(|_| panic!("hook bug"));
+    let counter = Arc::clone(&later_hook_ran);
+    app.on_commit(move |_| *counter.lock().unwrap() += 1);
+
+    let commits = app.subscribe();
+    app.update(|s| s.settings.max_parallel = 2).await?;
+
+    assert!(
+        commits.has_changed()?,
+        "subscribers still hear about the commit"
+    );
+    assert_eq!(*later_hook_ran.lock().unwrap(), 1);
+    assert_eq!(app.read().settings.max_parallel, 2);
+    Ok(())
+}
+
+#[test]
+fn hooks_can_register_hooks() -> eyre::Result<()> {
+    let app = App::memory();
+    let inner_app = app.clone();
+    let registered = Arc::new(Mutex::new(false));
+
+    let flag = Arc::clone(&registered);
+    app.on_commit(move |_| {
+        let mut flag = flag.lock().unwrap();
+        if !*flag {
+            *flag = true;
+            inner_app.on_commit(|_| {});
+        }
+    });
+
+    app.update_blocking(|s| s.history.push("one".into()))?;
+    app.update_blocking(|s| s.history.push("two".into()))?;
+    assert!(*registered.lock().unwrap());
+    Ok(())
+}
+
+#[test]
+fn blocking_and_async_updates_share_a_tiny_blocking_pool() -> eyre::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async {
+        let app = App::memory();
+
+        let blocking = {
+            let app = app.clone();
+            tokio::task::spawn_blocking(move || {
+                for index in 0..20 {
+                    app.update_blocking(|s| s.history.push(format!("blocking {index}")))
+                        .unwrap();
+                }
+            })
+        };
+
+        for index in 0..20 {
+            app.update(|s| s.history.push(format!("async {index}")))
+                .await?;
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), blocking).await??;
+        assert_eq!(app.read().history.len(), 40);
+        eyre::Ok(())
+    })
+}
+
+#[tokio::test]
+async fn values_that_cannot_round_trip_are_refused() -> eyre::Result<()> {
+    #[derive(Clone, Default, Serialize, Deserialize)]
+    struct Item {
+        name: String,
+        // without `default`, an empty list would be skipped on write and missing on read
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+    }
+
+    #[derive(Clone, Durable)]
+    struct Items {
+        item: DurableCell<Item>,
+    }
+
+    let dir = TempDir::new()?;
+    let items = Items::builder().dir(dir.path()).open()?;
+
+    let result = items.update(|s| s.item.name = "x".into()).await;
+    assert!(
+        matches!(result, Err(Error::Encode { .. })),
+        "got {result:?}"
+    );
+    assert_eq!(items.read().item.name, "");
+
+    drop(items);
+    let items = Items::builder().dir(dir.path()).open()?;
+    assert_eq!(items.read().item.name, "");
+    Ok(())
+}
+
+#[tokio::test]
+async fn changes_that_cancel_out_write_nothing() -> eyre::Result<()> {
+    let app = App::memory();
+    let commits = app.subscribe();
+
+    app.update(|s| {
+        s.tasks.insert(
+            9,
+            Task {
+                name: "temporary".into(),
+                done: false,
+            },
+        );
+        s.tasks.remove(&9);
+        s.history.push("temporary".into());
+        s.history.pop();
+    })
+    .await?;
+
+    assert!(
+        !commits.has_changed()?,
+        "nothing reached storage, so nothing was announced"
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_identifier_fields_use_their_plain_names() -> eyre::Result<()> {
+    #[derive(Clone, Durable)]
+    struct Keywords {
+        r#type: DurableCell<String>,
+    }
+
+    let state = Keywords::memory();
+    let mut commits = state.subscribe();
+    state.update_blocking(|s| s.r#type.set("kind".into()))?;
+
+    assert!(commits.borrow_and_update().changed("type"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn new_files_are_private() -> eyre::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new()?;
+    let app = App::builder().dir(dir.path().join("nested")).open()?;
+    let path = app.path().expect("file backed");
+
+    assert_eq!(std::fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::metadata(path.parent().unwrap())?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
     Ok(())
 }

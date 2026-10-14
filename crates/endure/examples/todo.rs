@@ -12,7 +12,7 @@ struct Todo {
     done: bool,
 }
 
-#[derive(Durable)]
+#[derive(Clone, Durable)]
 struct Todos {
     items: DurableMap<u64, Todo>,
     next_id: DurableCell<u64>,

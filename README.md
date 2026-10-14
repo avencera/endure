@@ -2,12 +2,12 @@
 
 Durable app state for Rust that feels like in-memory data.
 
-Put persistent collections in a struct and derive `Durable`. Reads are plain field access. Writes are ordinary mutation inside a closure. When the closure returns, endure writes only the entries that changed to a [redb](https://github.com/cberner/redb) file in one transaction, and only after that commit does anyone else see the change. Restart the process and the state is still there.
+Put persistent collections in a struct and derive `Clone` and `Durable`. Reads are plain field access. Writes are ordinary mutation inside a closure. When the closure returns, endure writes only the entries that changed to a [redb](https://github.com/cberner/redb) file in one transaction, and only after that commit does anyone else see the change. Restart the process and the state is still there.
 
 ```rust
 use endure::{Durable, DurableCell, DurableMap, DurableVec};
 
-#[derive(Durable)]
+#[derive(Clone, Durable)]
 struct App {
     approvals: DurableMap<ApprovalId, Approval>,
     settings: DurableCell<Settings>,
@@ -37,7 +37,7 @@ app.update(|s| {
 
 Pushing, inserting or removing one `DurableVec` element writes one row; nothing shifts on disk. Cloning any collection is O(1), because the data lives in structurally shared trees from [imbl](https://github.com/jneem/imbl).
 
-Keys and values need `Clone` and serde's `Serialize` and `Deserialize`. Map keys also need `Ord`.
+Keys and values need `Clone` and serde's `Serialize` and `Deserialize`. Map keys also need `Ord`. Before anything is written, endure checks that each changed value reads back to the same bytes. A type that can't round-trip, such as one using `skip_serializing_if` without `default`, is refused with `Error::Encode` instead of leaving a file that won't open.
 
 Fields marked `#[durable(skip)]` live in memory only and start as `Default::default()`.
 
@@ -66,7 +66,7 @@ app.try_update(|s| {
 app.update_blocking(|s| s.settings.max_parallel = 2)?;
 ```
 
-Updates run one at a time, in the order they were called. Inside the closure you work on a private copy, so a returned error, a panic or a failed commit leaves the state exactly as it was.
+Updates run one at a time, in the order they reach the writer lock, which is fair. Inside the closure you work on a private copy, so a returned error or a panic leaves the state exactly as it was. Once the closure has run, dropping the `update` future (a timeout, `select!`, a disconnected client) doesn't cancel the commit: it still finishes and becomes visible.
 
 ## Where the data lives
 
@@ -135,15 +135,18 @@ app.on_commit(|commit| push_to_ui(commit.changed.to_vec()));
 
 Values are stored as MessagePack with named fields. Adding a field marked `#[serde(default)]` or removing a field needs nothing extra.
 
-For changes serde can't absorb, list the earlier value types on the field, oldest first, and implement `From` between consecutive versions. Stored values are upgraded and rewritten in the same transaction that opens the state:
+For changes serde can't absorb, list the earlier value types on the field with their version numbers, oldest first, and implement `From` between consecutive versions. The current type gets the next number. Stored values are upgraded and rewritten in the same transaction that opens the state:
 
 ```rust
-#[derive(Durable)]
+#[derive(Clone, Durable)]
 struct App {
-    #[durable(versions(ApprovalV1, ApprovalV2))]
-    approvals: DurableMap<ApprovalId, Approval>, // ApprovalV1 -> ApprovalV2 -> Approval
+    // ApprovalV1 -> ApprovalV2 -> Approval, which is version 3
+    #[durable(versions(ApprovalV1 = 1, ApprovalV2 = 2))]
+    approvals: DurableMap<ApprovalId, Approval>,
 }
 ```
+
+When no stored data needs a version any more, drop its entry. The numbers are explicit, so data older than the first listed version fails to open with `Error::OlderSchema` instead of being decoded as the wrong type.
 
 To rename a field without losing its data, keep the old table name: `#[durable(table = "old_name")]`.
 
@@ -151,27 +154,36 @@ A build that finds data written by a newer version of a field refuses to open wi
 
 ## Custom storage
 
-Any redb `StorageBackend` works, for example one that encrypts pages at rest:
+Any redb `StorageBackend` works, for example one that encrypts pages at rest. Pass a function that builds it, so endure can reopen the storage after an I/O error:
 
 ```rust
-let app = App::builder().backend(MyEncryptedBackend::new(key)).open()?;
+let app = App::builder()
+    .backend_with(move || MyEncryptedBackend::open(&path, &key))
+    .open()?;
 ```
+
+`.backend(..)` takes a single backend instance instead. It can't be reopened, so an I/O error poisons the handle.
 
 ## Guarantees
 
-- The redb file is the single source of truth. Memory only ever holds committed state.
-- Each update is one atomic transaction. `update` resolves after the data is durable.
-- Updates apply in call order. Readers never see a change before it commits.
-- If a commit fails, endure reloads the state from disk, so memory and disk never disagree. If that reload also fails, further updates return `Error::Poisoned` until the state is reopened.
+- The redb file is the single source of truth. Memory only ever holds state read from it or committed to it.
+- Each update is one atomic transaction. `update` resolves after the data is durable, and readers never see a change before it commits.
+- Updates commit in the order they acquire the fair writer lock.
+- A failed commit returns `Error::CommitFailed`. Its changes may or may not have reached storage, so endure reopens the storage and reloads, and `read()` then shows what was actually saved. Don't retry blindly; check the state first.
+- If storage can't be reopened, the handle is poisoned: `is_poisoned()` returns true, updates return `Error::Poisoned`, and reads may be stale until you open the state again.
 - Only one process can open a file at a time.
 
 ## Limits
 
 - The whole state is loaded into memory when it opens. It suits app state, settings, queues and indexes, not large datasets.
-- Map keys are not versioned. Changing a key type needs a manual migration.
+- A `DurableCell` holds its value behind an `Arc`, so the first change in an update copies the whole value and the commit rewrites it. Keep large collections in a `DurableMap` or `DurableVec`.
+- Map keys are not versioned. Changing a key type needs a manual migration. Keys that compare equal with `Ord` must also serialize identically.
 - Values must not use interior mutability such as `RefCell` or `Mutex`. Changes made through them bypass change tracking and are never saved.
-- The derive implements `Clone` for the struct, so don't derive `Clone` as well.
-- Commit hooks run while the writer lock is held, so they must not call `update`.
+- `Option<Option<T>>` can't tell `Some(None)` from `None` once stored.
+- Removing a field leaves its table in the file. Adding a field with the same name later reads the old data.
+- `get_mut` and `DerefMut` mark an entry changed even if you don't modify it, so it is rewritten.
+- The derive adds `open`, `builder` and `memory` functions to the struct, so it can't have its own functions with those names.
+- Commit hooks run while the writer lock is held, so they must not call `update`. A hook that captures a clone of the handle keeps the file open for the life of the process; use `subscribe` when the reaction needs the handle.
 
 ## Not yet
 

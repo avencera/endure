@@ -1,6 +1,6 @@
 //! Durable app state that feels like in-memory data
 //!
-//! Put persistent collections in a struct, derive [`Durable`], and open it. Reads are plain field
+//! Put persistent collections in a struct, derive [`Durable`](macro@Durable), and open it. Reads are plain field
 //! access on a committed snapshot. Writes are ordinary mutation inside an update closure; when the
 //! closure returns, the changed entries are written to a [redb](https://docs.rs/redb) file in one
 //! transaction, and only then does anyone else see them
@@ -14,7 +14,7 @@
 //!     max_parallel: u32,
 //! }
 //!
-//! #[derive(Durable)]
+//! #[derive(Clone, Durable)]
 //! struct App {
 //!     tasks: DurableMap<u64, String>,
 //!     settings: DurableCell<Settings>,
@@ -39,23 +39,28 @@
 //!
 //! # Guarantees
 //!
-//! - The file is the single source of truth. Memory holds only committed state
-//! - Updates run one at a time, in call order. Each is one atomic transaction
-//! - An update resolves only after its changes are durable
-//! - If the closure returns an error or panics, or the commit fails, nothing changes
+//! - The file is the single source of truth. Memory holds only state read from it or committed
+//!   to it
+//! - Updates run one at a time, in the order they acquire a fair writer lock. Each is one atomic
+//!   transaction, and resolves only after its changes are durable
+//! - If the closure returns an error or panics, nothing changes. Once the closure has run,
+//!   dropping the update future does not cancel the commit
+//! - A failed commit returns [`Error::CommitFailed`] and the state is reloaded from storage, so
+//!   [`Durable::read`] shows what was actually saved
 //! - Only one process can open a file at a time
 //!
 //! # Schema changes
 //!
 //! Values are stored as MessagePack with named fields, so adding a field marked
 //! `#[serde(default)]` or removing one needs no migration. For a change serde cannot absorb, list
-//! the old value types on the field and implement `From` between consecutive versions:
+//! the old value types on the field with their version numbers and implement `From` between
+//! consecutive versions:
 //!
 //! ```ignore
-//! #[derive(Durable)]
+//! #[derive(Clone, Durable)]
 //! struct App {
-//!     // stored values written as ApprovalV1 are upgraded to Approval on open
-//!     #[durable(versions(ApprovalV1))]
+//!     // values stored as ApprovalV1 (version 1) are upgraded to Approval (version 2) on open
+//!     #[durable(versions(ApprovalV1 = 1))]
 //!     approvals: DurableMap<ApprovalId, Approval>,
 //! }
 //! ```
@@ -83,5 +88,5 @@ pub use redb;
 #[doc(hidden)]
 pub mod __private {
     pub use crate::codec::decode;
-    pub use crate::field::{Changes, Field, FieldSpec, Loader, State};
+    pub use crate::field::{Changes, Field, FieldSpec, Loader, State, Versions};
 }

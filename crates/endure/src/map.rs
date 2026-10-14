@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::{Index, RangeBounds};
 
@@ -16,8 +16,10 @@ use crate::field::{Field, Op};
 /// because the entries live in a structurally shared tree
 pub struct DurableMap<K, V> {
     entries: imbl::OrdMap<K, V>,
-    // keys touched since the last commit; their current presence decides put or delete
-    dirty: BTreeSet<K>,
+    // keys touched since the last commit, each with whether it was stored before the update;
+    // the key's presence at commit decides put or delete, and a key that was neither stored
+    // before nor present now needs no write at all
+    dirty: BTreeMap<K, bool>,
 }
 
 impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
@@ -25,7 +27,7 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
     pub fn new() -> Self {
         Self {
             entries: imbl::OrdMap::new(),
-            dirty: BTreeSet::new(),
+            dirty: BTreeMap::new(),
         }
     }
 
@@ -65,23 +67,25 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
     {
         // record the key before handing out the reference so a change can never go unseen
         let (stored_key, _) = self.entries.get_key_value(key)?;
-        self.dirty.insert(stored_key.clone());
+        let stored_key = stored_key.clone();
+        self.touch(&stored_key, true);
         self.entries.get_mut(key)
     }
 
     /// Returns a mutable reference to the value for `key`, inserting `default()` first if absent
     pub fn get_or_insert_with(&mut self, key: K, default: impl FnOnce() -> V) -> &mut V {
-        if !self.entries.contains_key(&key) {
+        let existed = self.entries.contains_key(&key);
+        self.touch(&key, existed);
+        if !existed {
             self.entries.insert(key.clone(), default());
         }
 
-        self.dirty.insert(key.clone());
         self.entries.get_mut(&key).expect("entry was just ensured")
     }
 
     /// Inserts a value, returning the previous value for the key
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.dirty.insert(key.clone());
+        self.touch(&key, self.entries.contains_key(&key));
         self.entries.insert(key, value)
     }
 
@@ -92,7 +96,7 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
         Q: Ord + ?Sized,
     {
         let (stored_key, value) = self.entries.remove_with_key(key)?;
-        self.dirty.insert(stored_key);
+        self.touch(&stored_key, true);
         Some(value)
     }
 
@@ -107,13 +111,17 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
 
         for key in removed {
             self.entries.remove(&key);
-            self.dirty.insert(key);
+            self.touch(&key, true);
         }
     }
 
     /// Removes every entry
     pub fn clear(&mut self) {
-        self.dirty.extend(self.entries.keys().cloned());
+        let keys: Vec<K> = self.entries.keys().cloned().collect();
+        for key in &keys {
+            self.touch(key, true);
+        }
+
         self.entries.clear();
     }
 
@@ -121,11 +129,10 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
     pub fn for_each_mut(&mut self, mut f: impl FnMut(&K, &mut V)) {
         let keys: Vec<K> = self.entries.keys().cloned().collect();
         for key in keys {
+            self.touch(&key, true);
             if let Some(value) = self.entries.get_mut(&key) {
                 f(&key, value);
             }
-
-            self.dirty.insert(key);
         }
     }
 
@@ -162,6 +169,14 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
     /// Returns the entry with the largest key
     pub fn last(&self) -> Option<(&K, &V)> {
         self.entries.get_max().map(|(key, value)| (key, value))
+    }
+
+    // a key's first touch in an update records whether it was stored before; it is present now
+    // exactly when it was stored before, because any earlier change would have touched it already
+    fn touch(&mut self, key: &K, present: bool) {
+        if !self.dirty.contains_key(key) {
+            self.dirty.insert(key.clone(), present);
+        }
     }
 }
 
@@ -227,7 +242,7 @@ impl<K: Ord + Clone, V: Clone> Extend<(K, V)> for DurableMap<K, V> {
 impl<K, V> Field for DurableMap<K, V>
 where
     K: Ord + Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
-    V: Clone + Serialize + Send + Sync + 'static,
+    V: Clone + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     type Item = V;
 
@@ -243,23 +258,25 @@ where
 
         Ok(Self {
             entries,
-            dirty: BTreeSet::new(),
+            dirty: BTreeMap::new(),
         })
     }
 
     fn mark_all_changed(&mut self) {
-        self.dirty.extend(self.entries.keys().cloned());
+        self.dirty = self.entries.keys().map(|key| (key.clone(), true)).collect();
     }
 
     fn take_ops(&mut self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
-        for key in std::mem::take(&mut self.dirty) {
+        for (key, was_stored) in std::mem::take(&mut self.dirty) {
             let value = match self.entries.get(&key) {
-                Some(value) => Some(codec::encode(table, value)?),
+                Some(value) => Some(codec::encode_checked(table, value)?),
+                // added and removed within one update, so storage never saw it
+                None if !was_stored => continue,
                 None => None,
             };
 
             ops.push(Op {
-                key: codec::encode(table, &key)?,
+                key: codec::encode_checked(table, &key)?,
                 value,
             });
         }
