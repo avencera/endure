@@ -7,7 +7,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
 use crate::error::{Error, Result};
-use crate::field::{self, Field, Op};
+use crate::field::{self, Field, Layout, Op};
 
 // each element is stored under a hidden u64 order key; keys increase along the vector and leave
 // gaps so a push or an insert writes one row instead of shifting every later element
@@ -315,7 +315,7 @@ where
         table: &str,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
         decode: &dyn Fn(&[u8]) -> Result<T>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Layout)> {
         let mut vec = Self::new();
         // rows arrive sorted by key bytes, and big-endian keys sort numerically
         for (key, value) in rows {
@@ -328,7 +328,8 @@ where
             vec.items.push_back(decode(&value)?);
         }
 
-        Ok(vec)
+        // order keys are plain integers, so their bytes are always the ones a write produces
+        Ok((vec, Layout::Current))
     }
 
     fn all_ops(&self, table: &str, ops: &mut Vec<Op>) -> Result<()> {

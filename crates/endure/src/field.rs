@@ -27,6 +27,16 @@ pub struct Op {
     pub value: Option<Vec<u8>>,
 }
 
+/// Whether a field's stored rows are exactly the rows it would write now
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// Every row is stored under the key the field would write
+    Current,
+    /// Some row is stored under bytes the field no longer produces, such as a map key written
+    /// before a field was added to the key type, so the table must be rewritten
+    Stale,
+}
+
 /// A persistent collection that can be a field of a durable state struct
 pub trait Field: Clone + Send + Sync + 'static {
     /// The stored element type, which schema versions upgrade into
@@ -37,7 +47,7 @@ pub trait Field: Clone + Send + Sync + 'static {
         table: &str,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
         decode: &dyn Fn(&[u8]) -> Result<Self::Item>,
-    ) -> Result<Self>;
+    ) -> Result<(Self, Layout)>;
 
     /// Writes every element, for rewriting a whole table
     fn all_ops(&self, table: &str, ops: &mut Vec<Op>) -> Result<()>;
@@ -124,15 +134,32 @@ const META: TableDefinition<&str, u32> = TableDefinition::new("__endure_meta");
 const FORMAT: TableDefinition<&str, u32> = TableDefinition::new("__endure_format");
 const FORMAT_KEY: &str = "version";
 const FORMAT_VERSION: u32 = 1;
+// number of the last commit, so recovery can tell whether a failed commit reached storage
+const COMMITS: TableDefinition<&str, u64> = TableDefinition::new("__endure_commits");
+const COMMITS_KEY: &str = "last";
 
 pub(crate) fn table(name: &str) -> TableDefinition<'_, &'static [u8], &'static [u8]> {
     TableDefinition::new(name)
+}
+
+/// Returns the number of the last commit stored in this transaction's view, or 0
+pub(crate) fn last_commit(txn: &WriteTransaction) -> Result<u64> {
+    let commits = txn.open_table(COMMITS)?;
+    Ok(commits.get(COMMITS_KEY)?.map_or(0, |guard| guard.value()))
+}
+
+/// Records `number` as the last commit, inside the transaction that commits it
+pub(crate) fn record_commit(txn: &WriteTransaction, number: u64) -> Result<()> {
+    txn.open_table(COMMITS)?.insert(COMMITS_KEY, number)?;
+    Ok(())
 }
 
 /// Reads every field of a state struct inside one write transaction, upgrading old schema
 /// versions in place
 pub struct Loader<'txn> {
     txn: &'txn WriteTransaction,
+    // set once anything was written, so opening a current file can skip the commit
+    wrote: bool,
 }
 
 impl<'txn> Loader<'txn> {
@@ -140,20 +167,26 @@ impl<'txn> Loader<'txn> {
         let mut format_table = txn.open_table(FORMAT)?;
         let format = format_table.get(FORMAT_KEY)?.map(|guard| guard.value());
 
-        match format {
+        let wrote = match format {
             Some(found) if found > FORMAT_VERSION => {
                 return Err(Error::UnsupportedFormat {
                     found,
                     supported: FORMAT_VERSION,
                 });
             }
-            Some(_) => {}
+            Some(_) => false,
             None => {
                 format_table.insert(FORMAT_KEY, FORMAT_VERSION)?;
+                true
             }
-        }
+        };
 
-        Ok(Self { txn })
+        Ok(Self { txn, wrote })
+    }
+
+    /// Returns true if loading wrote anything that must be committed
+    pub(crate) fn wrote(&self) -> bool {
+        self.wrote
     }
 
     /// Loads one field, decoding each stored value with `decode(stored_version, bytes)`
@@ -174,7 +207,8 @@ impl<'txn> Loader<'txn> {
         }
 
         let mut meta = self.txn.open_table(META)?;
-        let stored = match meta.get(table_name)?.map(|guard| guard.value()) {
+        let recorded = meta.get(table_name)?.map(|guard| guard.value());
+        let stored = match recorded {
             Some(stored) => stored,
             // rows without a recorded version predate versioning, so they are version 1
             None if !rows.is_empty() => 1,
@@ -198,15 +232,23 @@ impl<'txn> Loader<'txn> {
             });
         }
 
-        let field = F::load(table_name, rows, &|bytes| decode(stored, bytes))?;
+        let (field, layout) = F::load(table_name, rows, &|bytes| decode(stored, bytes))?;
 
-        if stored < versions.current {
+        // an upgrade or a stale key can change the bytes of any key, so clear the table first
+        // instead of leaving rows behind that a later open would read again
+        if stored < versions.current || layout == Layout::Stale {
             let mut ops = Vec::new();
             field.all_ops(table_name, &mut ops)?;
+            table.retain(|_, _| false)?;
             apply(&mut table, &ops)?;
+            self.wrote = true;
         }
 
-        meta.insert(table_name, versions.current)?;
+        if recorded != Some(versions.current) {
+            meta.insert(table_name, versions.current)?;
+            self.wrote = true;
+        }
+
         Ok(field)
     }
 }

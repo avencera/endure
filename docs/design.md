@@ -15,16 +15,18 @@ The redb file is the source of truth. The in-memory state is a copy of the last 
 
 Each `update` runs these steps while holding a FIFO writer lock:
 
-1. Clone the current snapshot. The collections are persistent trees (`imbl::OrdMap` and `imbl::Vector`), and cells hold an `Arc`, so this clone is O(number of fields), not O(data).
+1. Clone the current snapshot. The collections are persistent trees (`imbl::OrdMap` and `imbl::Vector`), and cells hold an `Arc`, so cloning them is O(number of fields), not O(data). Memory-only (`#[durable(skip)]`) fields use their own `Clone`, which may copy the whole value.
 2. Run the closure on the clone. Collections record which keys it touched: `get_mut`, `insert`, `remove` and the other mutators mark keys as they are called, not when a guard drops, so a change can't go unrecorded.
 3. Encode only the touched entries, check that each decodes again, and write them in one redb write transaction.
 4. Publish the clone as the new snapshot with `arc-swap`, notify subscribers, and release the lock.
 
 If the closure returns an error or panics, or the commit fails, the clone is dropped and nobody ever saw it. Rollback costs nothing.
 
+This depends on values having no interior mutability. Snapshots share values, so a write through a `Mutex` or `RefCell` inside one is visible in every snapshot at once, is not rolled back, and bypasses change tracking. The documentation tells users not to do that; a deep copy per update would prevent it but give up the O(1) clone.
+
 Async updates run step 2 in the caller's task. They then hand the owned writer lock, the new state and the encoded changes to a dedicated writer thread, which does steps 3 and 4. The caller waits for the result on a oneshot channel. Dropping the caller's future therefore can't split writing from publishing, and commits never occupy tokio's blocking pool or an async worker thread. Blocking updates do every step on the calling thread.
 
-A failed commit is the one case where storage might be ahead of memory, because a commit can fail after its data reached the file. The caller gets `Error::CommitFailed`, and endure reloads instead of guessing. redb refuses all further work after an I/O error, so endure drops the database, opens the storage again (the same path, or the factory given to `backend_with`), and loads the state from it. Memory-only fields are carried over from the previous snapshot. If the storage can't be reopened, the handle is poisoned: updates return `Error::Poisoned`, `is_poisoned()` reports it, and reads keep serving the last known state until the application reopens it.
+A failed commit is the one case where storage might be ahead of memory, because a commit can fail after its data reached the file. The caller gets `Error::CommitFailed`, and endure reloads instead of guessing. redb refuses all further work after an I/O error, so endure drops the database, opens the storage again (the same path, or the factory given to `backend_with`), and loads the state from it. Memory-only fields are carried over from the previous snapshot. Each commit also records its number in `__endure_commits`. After the reload, endure compares the stored number with the one the failed commit wrote. If they match, the commit landed after all, so memory-only fields take the closure's edits along with the persisted ones; otherwise they keep their previous values. If the storage can't be reopened, the handle is poisoned: updates return `Error::Poisoned`, `is_poisoned()` reports it, and reads keep serving the last known state until the application reopens it.
 
 ## Storage layout
 
@@ -33,7 +35,10 @@ A failed commit is the one case where storage might be ahead of memory, because 
 - List elements are stored under hidden `u64` order keys, written big-endian so redb returns them in list order. Keys start `2^32` apart. A push, insert or remove touches one row. When an insert finds no gap between two neighbours, the list is renumbered and rewritten once.
 - Keys and values are encoded as MessagePack with named fields (`rmp-serde`). The format is self-describing, so serde attributes such as `#[serde(default)]` handle additive changes without a migration. Positional formats like postcard or bincode would not.
 - Map keys don't need an order-preserving encoding. All reads and range queries run in memory on the ordered tree, so the on-disk order of map keys never matters.
-- `__endure_meta` records the storage format version and each table's schema version.
+- Writes and deletes re-encode a map key, so stored key bytes must be exactly what the key encodes to now. Adding a `#[serde(default)]` field to a key type breaks that. On open, each key is encoded again; if any stored bytes differ, the table is cleared and rewritten in the loading transaction. Two rows that decode to the same key fail the open.
+- A cell table holds at most the one row with an empty key. Any other row fails the open, so a cell never hides and later damages a map or list stored under the same name.
+- `__endure_format` records the storage format version, `__endure_meta` each table's schema version, and `__endure_commits` the number of the last commit. The format version has its own table so no user table name can collide with its key.
+- Opening a file that needs no format record, version record or upgrade aborts its transaction, so a plain open writes nothing.
 
 ## Schema versions
 
@@ -41,7 +46,7 @@ Each field lists its earlier value types with explicit, consecutive version numb
 
 - A table with rows but no recorded version is treated as version 1. An empty table is recorded at the current version.
 - Data older than the first listed version fails with `Error::OlderSchema`.
-- If the stored version is older, every value is decoded as the matching old type, converted through the `From` chain, and rewritten at the current version. This happens in the same transaction that loads the state, so an upgrade either completes or never happened.
+- If the stored version is older, every value is decoded as the matching old type, converted through the `From` chain, and the table is cleared and rewritten at the current version. This happens in the same transaction that loads the state, so an upgrade either completes or never happened.
 - If the stored version is newer than the build knows, the open fails with `Error::NewerSchema`. An older build never rewrites data it can't fully understand.
 
 ## Concurrency
@@ -53,7 +58,7 @@ Each field lists its earlier value types with explicit, consecutive version numb
 
 ## Notifications
 
-Each commit produces a `Commit` with the new snapshot and the names of the persisted fields it changed. A reload after a failed commit produces one listing every field. Subscribers get it through a `tokio::sync::watch` channel, which always holds the latest commit. Subscribers are updated first, then `on_commit` hooks run synchronously, in commit order, while the writer lock is still held. For async updates that happens on the writer thread, which enters the caller's tokio runtime first, so hooks can spawn tasks. A hook that panics is caught, so it can't fail a commit that already succeeded or hide it from subscribers. Hooks live in an `ArcSwap` list, so a hook can register another hook without deadlocking.
+Each commit produces a `Commit` with the new snapshot and the names of the persisted fields it changed. A reload after a failed commit produces one listing every field. Subscribers get it through a `tokio::sync::watch` channel, which always holds the latest commit. An update that changes only memory-only fields replaces the snapshot in the channel without waking anyone or running hooks, so `borrow()` agrees with `read()`. Subscribers are updated first, then `on_commit` hooks run synchronously, in commit order, while the writer lock is still held. For async updates that happens on the writer thread, which enters the caller's tokio runtime first, so hooks can spawn tasks. A hook that panics is caught, so it can't fail a commit that already succeeded or hide it from subscribers. Hooks live in an `ArcSwap` list, so a hook can register another hook without deadlocking.
 
 Each collection also carries an epoch, a process-wide unique number given to it when it is loaded, created, or committed. An update compares every field's epoch with the committed state it started from. A field replaced wholesale (`s.map = DurableMap::new()`, `mem::take`, or a clone from an older snapshot) has a different epoch, so endure rewrites its table: it deletes rows the new value lacks and writes every entry. That keeps memory and disk in agreement even when change tracking is bypassed.
 

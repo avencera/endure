@@ -6,8 +6,8 @@ use std::ops::{Index, RangeBounds};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
-use crate::error::Result;
-use crate::field::{self, Field, Op};
+use crate::error::{Error, Result};
+use crate::field::{self, Field, Layout, Op};
 
 /// An ordered map whose entries persist across restarts
 ///
@@ -254,17 +254,32 @@ where
         table: &str,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
         decode: &dyn Fn(&[u8]) -> Result<V>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Layout)> {
         let mut entries = imbl::OrdMap::new();
-        for (key, value) in rows {
-            entries.insert(codec::decode::<K>(table, &key)?, decode(&value)?);
+        let mut layout = Layout::Current;
+        for (bytes, value) in rows {
+            let key = codec::decode::<K>(table, &bytes)?;
+
+            // writes and deletes re-encode the key, so a key stored under other bytes (written
+            // before the key type gained or lost a field) could never be updated or removed
+            if codec::encode(table, &key)? != bytes {
+                layout = Layout::Stale;
+            }
+
+            if entries.insert(key, decode(&value)?).is_some() {
+                return Err(Error::Decode {
+                    table: table.to_owned(),
+                    message: "two stored keys decode to the same key".to_owned(),
+                });
+            }
         }
 
-        Ok(Self {
+        let map = Self {
             entries,
             dirty: BTreeMap::new(),
             epoch: field::next_epoch(),
-        })
+        };
+        Ok((map, layout))
     }
 
     fn all_ops(&self, table: &str, ops: &mut Vec<Op>) -> Result<()> {

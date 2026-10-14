@@ -5,8 +5,8 @@ use std::sync::Arc;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
-use crate::error::Result;
-use crate::field::{self, Field, Op};
+use crate::error::{Error, Result};
+use crate::field::{self, Field, Layout, Op};
 
 // a cell is stored as a single row under this key
 const CELL_KEY: &[u8] = b"";
@@ -98,16 +98,24 @@ where
     type Item = T;
 
     fn load(
-        _table: &str,
+        table: &str,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
         decode: &dyn Fn(&[u8]) -> Result<T>,
-    ) -> Result<Self> {
-        let value = match rows.into_iter().find(|(key, _)| key == CELL_KEY) {
-            Some((_, bytes)) => decode(&bytes)?,
-            None => T::default(),
+    ) -> Result<(Self, Layout)> {
+        let mut rows = rows.into_iter();
+        let value = match (rows.next(), rows.next()) {
+            (None, _) => T::default(),
+            (Some((key, bytes)), None) if key == CELL_KEY => decode(&bytes)?,
+            // a map or list stored here would be ignored, then damaged by the next write
+            _ => {
+                return Err(Error::Decode {
+                    table: table.to_owned(),
+                    message: "the table holds rows that are not a single cell value".to_owned(),
+                });
+            }
         };
 
-        Ok(Self::new(value))
+        Ok((Self::new(value), Layout::Current))
     }
 
     fn all_ops(&self, table: &str, ops: &mut Vec<Op>) -> Result<()> {

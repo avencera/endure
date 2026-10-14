@@ -2,6 +2,7 @@ use std::fmt;
 
 /// Errors from opening, reading, or committing durable state
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The storage engine reported an error
     #[error("storage error: {0}")]
@@ -93,9 +94,12 @@ from_redb!(
 /// The error from [`Durable::try_update`](crate::Durable::try_update)
 ///
 /// - `Rejected` carries the closure's own error; nothing was written
-/// - `Storage` means the closure succeeded but its changes were not committed; see
-///   [`Error::CommitFailed`]
+/// - `Storage` means the closure succeeded but its changes did not commit. With
+///   [`Error::CommitFailed`], or [`Error::Poisoned`] from a handle that became poisoned during
+///   this update, they may have reached storage anyway. Other errors, such as [`Error::Encode`],
+///   mean nothing was written
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum UpdateError<E> {
     /// The update closure returned an error
     Rejected(E),

@@ -300,3 +300,132 @@ fn an_explicit_version_survives_dropping_every_old_entry() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+mod keys {
+    use super::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    pub struct Thin {
+        pub id: u32,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    pub struct Wide {
+        pub id: u32,
+        #[serde(default)]
+        pub tag: String,
+    }
+
+    #[derive(Clone, Durable)]
+    pub struct ThinApp {
+        pub items: DurableMap<Thin, String>,
+    }
+
+    #[derive(Clone, Durable)]
+    pub struct WideApp {
+        pub items: DurableMap<Wide, String>,
+    }
+}
+
+fn wide(id: u32) -> keys::Wide {
+    keys::Wide {
+        id,
+        tag: String::new(),
+    }
+}
+
+#[test]
+fn keys_stored_before_a_key_field_was_added_can_be_updated_and_removed() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    {
+        let app = keys::ThinApp::builder().path(path(&dir)).open()?;
+        app.update_blocking(|s| {
+            s.items.insert(keys::Thin { id: 1 }, "removed".into());
+            s.items.insert(keys::Thin { id: 2 }, "old".into());
+        })?;
+    }
+
+    {
+        let app = keys::WideApp::builder().path(path(&dir)).open()?;
+        app.update_blocking(|s| {
+            s.items.remove(&wide(1));
+            s.items.insert(wide(2), "new".into());
+        })?;
+    }
+
+    let app = keys::WideApp::builder().path(path(&dir)).open()?;
+    let items: Vec<_> = app
+        .read()
+        .items
+        .iter()
+        .map(|(k, v)| (k.id, v.clone()))
+        .collect();
+    assert_eq!(items, [(2, "new".to_owned())]);
+    Ok(())
+}
+
+#[test]
+fn keys_stored_before_a_key_field_was_removed_can_be_updated() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    {
+        let app = keys::WideApp::builder().path(path(&dir)).open()?;
+        app.update_blocking(|s| {
+            s.items.insert(
+                keys::Wide {
+                    id: 7,
+                    tag: "x".into(),
+                },
+                "old".into(),
+            );
+        })?;
+    }
+
+    {
+        let app = keys::ThinApp::builder().path(path(&dir)).open()?;
+        app.update_blocking(|s| s.items.insert(keys::Thin { id: 7 }, "new".into()))?;
+    }
+
+    let app = keys::ThinApp::builder().path(path(&dir)).open()?;
+    let items: Vec<_> = app
+        .read()
+        .items
+        .iter()
+        .map(|(k, v)| (k.id, v.clone()))
+        .collect();
+    assert_eq!(items, [(7, "new".to_owned())]);
+    Ok(())
+}
+
+mod kinds {
+    use super::*;
+
+    #[derive(Clone, Durable)]
+    pub struct AsList {
+        pub history: DurableVec<String>,
+    }
+
+    #[derive(Clone, Durable)]
+    pub struct AsCell {
+        pub history: DurableCell<String>,
+    }
+}
+
+#[test]
+fn a_cell_refuses_to_open_over_a_list() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    {
+        let app = kinds::AsList::builder().path(path(&dir)).open()?;
+        app.update_blocking(|s| s.history.push("kept".into()))?;
+    }
+
+    let result = kinds::AsCell::builder().path(path(&dir)).open();
+    assert!(
+        matches!(result, Err(Error::Decode { .. })),
+        "got {result:?}"
+    );
+
+    // the list is untouched
+    let app = kinds::AsList::builder().path(path(&dir)).open()?;
+    assert_eq!(app.read().history.iter().collect::<Vec<_>>(), ["kept"]);
+    Ok(())
+}

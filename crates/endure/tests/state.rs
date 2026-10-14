@@ -211,8 +211,11 @@ async fn commits_notify_subscribers_and_hooks() -> eyre::Result<()> {
     assert!(!commit.changed("tasks"));
     assert_eq!(commit.snapshot.settings.theme, "dark");
 
-    // an update that only touches memory-only fields commits nothing and notifies nobody
+    // an update that only touches memory-only fields commits nothing and notifies nobody, but
+    // the watched snapshot still matches `read`
     app.update(|s| s.scratch.push(1)).await?;
+    assert!(!commits.has_changed()?);
+    assert_eq!(commits.borrow().snapshot.scratch, [1]);
     app.update(|s| s.history.push("x".into())).await?;
 
     assert_eq!(

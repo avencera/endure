@@ -45,6 +45,9 @@
 //!   transaction, and resolves only after its changes are durable
 //! - If the closure returns an error or panics, nothing changes. Once the closure has run,
 //!   dropping the update future does not cancel the commit
+//! - These guarantees cover changes made through the collections. Values must not use interior
+//!   mutability such as `Mutex`: snapshots share values, so a write through one is visible
+//!   everywhere at once and is neither rolled back nor tracked
 //! - A failed commit returns [`Error::CommitFailed`] and the state is reloaded from storage, so
 //!   [`Durable::read`] shows what was actually saved
 //! - Only one process can open a file at a time

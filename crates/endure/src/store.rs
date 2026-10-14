@@ -24,8 +24,8 @@ pub struct Durable<S: State> {
 }
 
 struct Inner<S: State> {
-    // only touched while the writer lock is held; `None` once storage could not be reopened
-    db: Mutex<Option<Database>>,
+    // only touched while the writer lock is held
+    storage: Mutex<Storage>,
     // opens the storage again after an I/O error, when the source allows it
     reopen: Option<Reopen>,
     path: Option<PathBuf>,
@@ -36,6 +36,13 @@ struct Inner<S: State> {
     hooks: ArcSwap<Vec<Arc<Hook<S>>>>,
     // runs async commits; started on the first one
     jobs: OnceLock<mpsc::Sender<Job<S>>>,
+}
+
+struct Storage {
+    // `None` once storage could not be reopened
+    db: Option<Database>,
+    // number of the last commit that reached storage
+    last_commit: u64,
 }
 
 type Hook<S> = dyn Fn(&Commit<S>) + Send + Sync;
@@ -231,7 +238,11 @@ impl<S: State> Durable<S> {
 
         match done.await {
             Ok(result) => result.map_err(UpdateError::Storage)?,
-            Err(_) => return Err(UpdateError::Storage(Error::Poisoned)),
+            // the writer thread died without answering, so the outcome is unknown
+            Err(_) => {
+                self.inner.poisoned.store(true, Ordering::Release);
+                return Err(UpdateError::Storage(Error::Poisoned));
+            }
         }
 
         Ok(output)
@@ -305,6 +316,11 @@ impl<S: State> Durable<S> {
             let removed = std::fs::remove_file(&path);
             drop(inner);
             removed?;
+
+            // persist the unlink, or a crash could bring the directory entry back
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
         }
 
         // an open file can't be deleted here, so close first; another process could open the
@@ -319,7 +335,7 @@ impl<S: State> Durable<S> {
     }
 
     fn from_db(db: Database, path: Option<PathBuf>, reopen: Option<Reopen>) -> Result<Self> {
-        let state = load::<S>(&db, None)?;
+        let (state, last_commit) = load::<S>(&db, |_| None)?;
         let snapshot = Snapshot(Arc::new(state));
         let (commits, _) = watch::channel(Commit {
             snapshot: snapshot.clone(),
@@ -328,7 +344,10 @@ impl<S: State> Durable<S> {
 
         Ok(Self {
             inner: Arc::new(Inner {
-                db: Mutex::new(Some(db)),
+                storage: Mutex::new(Storage {
+                    db: Some(db),
+                    last_commit,
+                }),
                 reopen,
                 path,
                 current: ArcSwap::new(snapshot.0),
@@ -368,45 +387,42 @@ impl<S: State> Inner<S> {
             return Ok(());
         }
 
+        let mut storage = self
+            .storage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let number = storage.last_commit + 1;
+
         // a panicking storage backend is treated like a failed commit, since the write may or
         // may not have landed
-        let written = catch_unwind(AssertUnwindSafe(|| self.write(&changes)))
+        let written = catch_unwind(AssertUnwindSafe(|| storage.write(number, &changes)))
             .unwrap_or_else(|panic| Err(Error::BackendPanicked(panic_message(&panic))));
 
         match written {
             Ok(()) => {
+                storage.last_commit = number;
+                drop(storage);
                 self.publish(next, changes.fields);
                 Ok(())
             }
             Err(error) => {
-                self.recover();
+                self.recover(&mut storage, &next, number);
                 Err(Error::CommitFailed(Box::new(error)))
             }
         }
     }
 
-    fn write(&self, changes: &Changes) -> Result<()> {
-        let db = self.db.lock().unwrap_or_else(|poison| poison.into_inner());
-        let db = db.as_ref().ok_or(Error::Poisoned)?;
-
-        let txn = db.begin_write()?;
-        for (name, ops) in &changes.tables {
-            let mut table = txn.open_table(field::table(name))?;
-            field::apply(&mut table, ops)?;
-        }
-
-        txn.commit()?;
-        Ok(())
-    }
-
     // a failed commit may or may not have reached storage, so reload instead of guessing
-    fn recover(&self) {
-        let mut slot = self.db.lock().unwrap_or_else(|poison| poison.into_inner());
+    fn recover(&self, storage: &mut Storage, next: &S, number: u64) {
         let previous = self.current.load_full();
+        // memory-only fields follow the persisted ones: when the failed commit is on disk after
+        // all, the closure's edits to them stand too
+        let carry = |last: u64| Some(if last == number { next } else { &*previous });
 
-        if let Some(db) = slot.as_ref()
-            && let Ok(state) = load::<S>(db, Some(&previous))
+        if let Some(db) = &storage.db
+            && let Ok((state, last)) = load(db, carry)
         {
+            storage.last_commit = last;
             self.publish_reload(state);
             return;
         }
@@ -414,14 +430,15 @@ impl<S: State> Inner<S> {
         // redb refuses all further work after an I/O error, so open the storage again; the old
         // handle is dropped first to release its file lock
         if let Some(reopen) = &self.reopen {
-            *slot = None;
+            storage.db = None;
 
             let reopened = catch_unwind(AssertUnwindSafe(reopen))
                 .unwrap_or_else(|panic| Err(Error::BackendPanicked(panic_message(&panic))))
-                .and_then(|db| load::<S>(&db, Some(&previous)).map(|state| (db, state)));
+                .and_then(|db| load(&db, carry).map(|loaded| (db, loaded)));
 
-            if let Ok((db, state)) = reopened {
-                *slot = Some(db);
+            if let Ok((db, (state, last))) = reopened {
+                storage.db = Some(db);
+                storage.last_commit = last;
                 self.publish_reload(state);
                 return;
             }
@@ -439,7 +456,13 @@ impl<S: State> Inner<S> {
         let snapshot = Snapshot(Arc::new(state));
         self.current.store(Arc::clone(&snapshot.0));
 
+        // nothing persisted changed, but memory-only fields may have; keep the watched value in
+        // step with `read` without waking subscribers or running hooks
         if changed.is_empty() {
+            self.commits.send_if_modified(|latest| {
+                latest.snapshot = snapshot;
+                false
+            });
             return;
         }
 
@@ -493,15 +516,38 @@ fn storage_error(error: UpdateError<Infallible>) -> Error {
     }
 }
 
-fn load<S: State>(db: &Database, previous: Option<&S>) -> Result<S> {
-    let txn = db.begin_write()?;
-    let state = {
-        let mut loader = Loader::new(&txn)?;
-        S::load(&mut loader, previous)?
-    };
+impl Storage {
+    fn write(&self, number: u64, changes: &Changes) -> Result<()> {
+        let db = self.db.as_ref().ok_or(Error::Poisoned)?;
 
-    txn.commit()?;
-    Ok(state)
+        let txn = db.begin_write()?;
+        for (name, ops) in &changes.tables {
+            let mut table = txn.open_table(field::table(name))?;
+            field::apply(&mut table, ops)?;
+        }
+
+        field::record_commit(&txn, number)?;
+        txn.commit()?;
+        Ok(())
+    }
+}
+
+// loads the state and the number of the last stored commit; `carry` picks, from that number,
+// the state whose memory-only fields survive
+fn load<'a, S: State>(db: &Database, carry: impl FnOnce(u64) -> Option<&'a S>) -> Result<(S, u64)> {
+    let txn = db.begin_write()?;
+    let last = field::last_commit(&txn)?;
+    let mut loader = Loader::new(&txn)?;
+    let state = S::load(&mut loader, carry(last))?;
+
+    // opening a current file changes nothing, so it should not cost a commit and an fsync
+    if loader.wrote() {
+        txn.commit()?;
+    } else {
+        txn.abort()?;
+    }
+
+    Ok((state, last))
 }
 
 type OpenOnce = Box<dyn FnOnce(&redb::Builder) -> Result<Database, redb::DatabaseError> + Send>;

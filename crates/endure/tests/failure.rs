@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use endure::redb::StorageBackend;
 use endure::redb::backends::FileBackend;
+use endure::redb::{Database, StorageBackend};
 use endure::{Durable, DurableMap, Error};
 use tempfile::TempDir;
 
@@ -15,6 +15,8 @@ use tempfile::TempDir;
 enum Fail {
     Write,
     Sync,
+    // the data is synced, then the call reports an error anyway
+    AfterSync,
 }
 
 // fails the next `remaining` calls of one kind, then behaves normally
@@ -90,7 +92,8 @@ impl StorageBackend for FlakyBackend {
 
     fn sync_data(&self) -> io::Result<()> {
         self.faults.check(Fail::Sync)?;
-        self.inner.sync_data()
+        self.inner.sync_data()?;
+        self.faults.check(Fail::AfterSync)
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
@@ -167,6 +170,34 @@ fn failed_write_recovers_with_memory_matching_disk() -> eyre::Result<()> {
 #[test]
 fn failed_sync_recovers_with_memory_matching_disk() -> eyre::Result<()> {
     failed_commit_recovers(Fail::Sync)
+}
+
+#[test]
+fn a_commit_that_landed_keeps_its_memory_only_edits() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("flaky.redb");
+    let faults = Faults::new(Fail::AfterSync);
+
+    let store = reopenable(&path, &faults);
+    store.update_blocking(|s| s.cache.push(1))?;
+
+    faults.fail_next(1);
+    let result = store.update_blocking(|s| {
+        s.entries.insert(2, "saved".into());
+        s.cache.push(2);
+    });
+    assert!(
+        matches!(result, Err(Error::CommitFailed(_))),
+        "got {result:?}"
+    );
+
+    // the commit reached storage, so the cache edit from the same closure stands with it
+    assert_eq!(keys(&store), [2]);
+    assert_eq!(store.read().cache, [1, 2]);
+
+    drop(store);
+    assert_eq!(keys_on_disk(&path), [2]);
+    Ok(())
 }
 
 #[test]
@@ -346,5 +377,82 @@ fn a_panicking_backend_fails_the_commit_and_reloads() -> eyre::Result<()> {
     let in_memory = keys(&store);
     drop(store);
     assert_eq!(in_memory, keys_on_disk(&path), "memory must match disk");
+    Ok(())
+}
+
+// counts syncs, which every commit needs and a plain open and close does not
+#[derive(Debug)]
+struct CountingBackend {
+    inner: FileBackend,
+    syncs: Arc<AtomicUsize>,
+}
+
+impl StorageBackend for CountingBackend {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.syncs.fetch_add(1, Ordering::SeqCst);
+        self.inner.sync_data()
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+
+    fn close(&self) -> io::Result<()> {
+        self.inner.close()
+    }
+}
+
+#[test]
+fn opening_a_current_file_commits_nothing() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("counted.redb");
+    let syncs = Arc::new(AtomicUsize::new(0));
+
+    let backend = || -> eyre::Result<CountingBackend> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        Ok(CountingBackend {
+            inner: FileBackend::new(file)?,
+            syncs: Arc::clone(&syncs),
+        })
+    };
+    let synced_by = |open: &dyn Fn() -> eyre::Result<()>| -> eyre::Result<usize> {
+        let before = syncs.load(Ordering::SeqCst);
+        open()?;
+        Ok(syncs.load(Ordering::SeqCst) - before)
+    };
+
+    let store = Store::builder().backend(backend()?).open()?;
+    store.update_blocking(|s| s.entries.insert(1, "one".into()))?;
+    drop(store);
+
+    // redb may sync while opening on its own; endure must add no commit of its own
+    let bare = synced_by(&|| {
+        drop(Database::builder().create_with_backend(backend()?)?);
+        Ok(())
+    })?;
+    let endure = synced_by(&|| {
+        let store = Store::builder().backend(backend()?).open()?;
+        assert_eq!(keys(&store), [1]);
+        Ok(())
+    })?;
+
+    assert_eq!(endure, bare, "opening a current file committed");
     Ok(())
 }

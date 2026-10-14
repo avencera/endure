@@ -341,6 +341,16 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
         ));
     }
 
+    // the current version is one past the last listed one, so that one must leave room
+    if let Some(last) = versions.last()
+        && last.number == u32::MAX
+    {
+        return Err(syn::Error::new_spanned(
+            &last.ty,
+            "a listed schema version must be below u32::MAX",
+        ));
+    }
+
     for pair in versions.windows(2) {
         if pair[1].number != pair[0].number + 1 {
             return Err(syn::Error::new_spanned(

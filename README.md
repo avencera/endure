@@ -131,7 +131,8 @@ The same calls work from an HTTP handler, a CLI, or a background task.
 ## Watching for changes
 
 ```rust
-// a watch channel that always holds the latest commit
+// a watch channel; it wakes for commits that change persisted fields, and `borrow()` always
+// holds the latest snapshot
 let mut commits = app.subscribe();
 while commits.changed().await.is_ok() {
     let commit = commits.borrow_and_update().clone();
@@ -182,7 +183,7 @@ let app = App::builder()
 - The redb file is the single source of truth. Memory only ever holds state read from it or committed to it.
 - Each update is one atomic transaction. `update` resolves after the data is durable, and readers never see a change before it commits.
 - Updates commit in the order they acquire the fair writer lock.
-- A failed commit returns `Error::CommitFailed`. Its changes may or may not have reached storage, so endure reopens the storage and reloads, and `read()` then shows what was actually saved. Don't retry blindly; check the state first.
+- A failed commit returns `Error::CommitFailed`. Its changes may or may not have reached storage, so endure reopens the storage and reloads, and `read()` then shows what was actually saved. Memory-only fields keep the closure's edits only if its commit turned out to be saved. Don't retry blindly; check the state first.
 - If storage can't be reopened, the handle is poisoned: `is_poisoned()` returns true, updates return `Error::Poisoned`, and reads may be stale until you open the state again.
 - Only one process can open a file at a time. A relative path is resolved when the state opens, so later changes to the working directory don't redirect it. `destroy` deletes the file while still holding its lock (on Unix), so nobody can open it in between.
 
@@ -190,8 +191,9 @@ let app = App::builder()
 
 - The whole state is loaded into memory when it opens. It suits app state, settings, queues and indexes, not large datasets.
 - A `DurableCell` holds its value behind an `Arc`, so the first change in an update copies the whole value and the commit rewrites it. Keep large collections in a `DurableMap` or `DurableVec`.
-- Map keys are not versioned. Changing a key type needs a manual migration. Keys that compare equal with `Ord` must also serialize identically.
-- Values must not use interior mutability such as `RefCell` or `Mutex`. Changes made through them bypass change tracking and are never saved.
+- Map keys are not versioned. Adding a `#[serde(default)]` field to a key type or removing one works: keys stored under old bytes are rewritten when the state opens. Any other key change needs a manual migration. Keys that compare equal with `Ord` must also serialize identically.
+- Switching a field between `DurableMap`, `DurableVec` and `DurableCell` needs a new table name. A cell refuses to open over other rows, but a map or list may misread them.
+- Values must not use interior mutability such as `RefCell` or `Mutex`. Snapshots share values, so a change made through one is visible in every snapshot at once, is not rolled back when the closure fails, and is saved only if a tracked mutation rewrites the same entry.
 - Serde attributes that lose data, such as `#[serde(skip)]`, apply on disk too. After a restart a skipped field comes back as its default. `Option<Option<T>>` can't tell `Some(None)` from `None` once stored.
 - If an `update` future is dropped while its commit is still finishing, `destroy` returns `Error::InUse` until the commit completes.
 - Removing a field leaves its table in the file. Adding a field with the same name later reads the old data.
