@@ -193,8 +193,9 @@ impl<T: Clone> DurableVec<T> {
 
     /// Sorts the list with a comparator, rewriting every element
     pub fn sort_by(&mut self, compare: impl Fn(&T, &T) -> Ordering) {
-        self.items.sort_by(compare);
+        // record first, since a panicking comparator can leave elements moved
         self.touch_all();
+        self.items.sort_by(compare);
     }
 
     /// Sorts the list, rewriting every element

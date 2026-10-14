@@ -672,3 +672,67 @@ async fn hooks_after_async_updates_can_spawn_tasks() -> eyre::Result<()> {
     assert_eq!(changed, Some(vec!["history"]));
     Ok(())
 }
+
+#[test]
+fn a_caught_comparator_panic_still_saves_the_order() -> eyre::Result<()> {
+    #[derive(Clone, Durable)]
+    struct Numbers {
+        list: DurableVec<u32>,
+    }
+
+    let dir = TempDir::new()?;
+    let numbers = Numbers::builder().dir(dir.path()).open()?;
+    numbers.update_blocking(|s| s.list.extend((0..40).rev()))?;
+
+    numbers.update_blocking(|s| {
+        let calls = std::cell::Cell::new(0);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            s.list.sort_by(|a, b| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 30 {
+                    panic!("comparator bug");
+                }
+                a.cmp(b)
+            })
+        }));
+    })?;
+
+    let in_memory: Vec<u32> = numbers.read().list.iter().copied().collect();
+    drop(numbers);
+
+    let reopened = Numbers::builder().dir(dir.path()).open()?;
+    assert_eq!(
+        reopened.read().list.iter().copied().collect::<Vec<_>>(),
+        in_memory
+    );
+    Ok(())
+}
+
+#[test]
+fn a_table_named_like_internal_metadata_is_harmless() -> eyre::Result<()> {
+    #[derive(Clone, Durable)]
+    struct Odd {
+        #[durable(table = "__format", version = 2)]
+        item: DurableCell<u32>,
+    }
+
+    let dir = TempDir::new()?;
+    let odd = Odd::builder().dir(dir.path()).open()?;
+    odd.update_blocking(|s| *s.item = 5)?;
+    drop(odd);
+
+    let odd = Odd::builder().dir(dir.path()).open()?;
+    assert_eq!(*odd.read().item.get(), 5);
+    Ok(())
+}
+
+#[test]
+fn builders_can_move_to_another_thread() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let builder = App::builder().dir(dir.path());
+    let app = std::thread::spawn(move || builder.open())
+        .join()
+        .expect("thread")?;
+    assert!(app.path().is_some());
+    Ok(())
+}

@@ -59,19 +59,18 @@ struct FlakyBackend {
 }
 
 impl FlakyBackend {
-    fn open(path: &Path, faults: Faults) -> Self {
+    fn open(path: &Path, faults: Faults) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)
-            .unwrap();
+            .open(path)?;
 
-        Self {
-            inner: FileBackend::new(file).unwrap(),
+        Ok(Self {
+            inner: FileBackend::new(file).map_err(io::Error::other)?,
             faults,
-        }
+        })
     }
 }
 
@@ -177,7 +176,7 @@ fn single_use_backend_poisons_after_a_failed_commit() -> eyre::Result<()> {
     let faults = Faults::new(Fail::Write);
 
     let store = Store::builder()
-        .backend(FlakyBackend::open(&path, faults.clone()))
+        .backend(FlakyBackend::open(&path, faults.clone())?)
         .open()?;
     store.update_blocking(|s| s.entries.insert(1, "kept".into()))?;
 
@@ -233,5 +232,119 @@ async fn async_failed_commit_recovers_on_the_writer_thread() -> eyre::Result<()>
     drop(store);
 
     assert_eq!(in_memory, keys_on_disk(&path));
+    Ok(())
+}
+
+#[test]
+fn a_factory_that_fails_to_reopen_poisons_the_handle() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("flaky.redb");
+    let faults = Faults::new(Fail::Write);
+    let reopen_allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let store = {
+        let path = path.clone();
+        let faults = faults.clone();
+        let reopen_allowed = Arc::clone(&reopen_allowed);
+        Store::builder()
+            .backend_with(move || {
+                if !reopen_allowed.load(Ordering::SeqCst) {
+                    return Err(io::Error::other("storage is gone"));
+                }
+
+                FlakyBackend::open(&path, faults.clone())
+            })
+            .open()?
+    };
+
+    store.update_blocking(|s| s.entries.insert(1, "kept".into()))?;
+
+    reopen_allowed.store(false, Ordering::SeqCst);
+    faults.fail_next(1);
+    let result = store.update_blocking(|s| s.entries.insert(2, "lost".into()));
+    assert!(
+        matches!(result, Err(Error::CommitFailed(_))),
+        "got {result:?}"
+    );
+    assert!(store.is_poisoned());
+    Ok(())
+}
+
+// a backend that panics in `sync_data` once, after the data was written
+#[derive(Debug)]
+struct PanickyBackend {
+    inner: FileBackend,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StorageBackend for PanickyBackend {
+    fn len(&self) -> io::Result<u64> {
+        self.inner.len()
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read(offset, out)
+    }
+
+    fn set_len(&self, len: u64) -> io::Result<()> {
+        self.inner.set_len(len)
+    }
+
+    fn sync_data(&self) -> io::Result<()> {
+        self.inner.sync_data()?;
+        if self.armed.swap(false, Ordering::SeqCst) {
+            panic!("backend bug");
+        }
+
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+        self.inner.write(offset, data)
+    }
+
+    fn close(&self) -> io::Result<()> {
+        self.inner.close()
+    }
+}
+
+#[test]
+fn a_panicking_backend_fails_the_commit_and_reloads() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("panicky.redb");
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let store = {
+        let path = path.clone();
+        let armed = Arc::clone(&armed);
+        Store::builder()
+            .backend_with(move || {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)?;
+                Ok(PanickyBackend {
+                    inner: FileBackend::new(file).map_err(io::Error::other)?,
+                    armed: Arc::clone(&armed),
+                })
+            })
+            .open()?
+    };
+
+    store.update_blocking(|s| s.entries.insert(1, "one".into()))?;
+
+    armed.store(true, Ordering::SeqCst);
+    let result = store.update_blocking(|s| s.entries.insert(2, "two".into()));
+    assert!(
+        matches!(result, Err(Error::CommitFailed(_))),
+        "got {result:?}"
+    );
+    assert!(!store.is_poisoned());
+
+    let in_memory = keys(&store);
+    drop(store);
+    assert_eq!(in_memory, keys_on_disk(&path), "memory must match disk");
     Ok(())
 }

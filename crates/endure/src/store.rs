@@ -39,7 +39,7 @@ struct Inner<S: State> {
 }
 
 type Hook<S> = dyn Fn(&Commit<S>) + Send + Sync;
-type Reopen = Box<dyn Fn() -> Result<Database, redb::DatabaseError> + Send + Sync>;
+type Reopen = Box<dyn Fn() -> Result<Database> + Send + Sync>;
 
 // an async commit handed to the writer thread together with the writer lock, so dropping the
 // caller's future can never separate writing the changes from publishing them
@@ -294,11 +294,25 @@ impl<S: State> Durable<S> {
     /// from a dropped `update` future is still finishing
     pub fn destroy(self) -> Result<()> {
         let inner = Arc::try_unwrap(self.inner).map_err(|_| Error::InUse)?;
-        let path = inner.path.clone();
-        drop(inner);
+        let Some(path) = inner.path.clone() else {
+            return Ok(());
+        };
 
-        if let Some(path) = path {
-            std::fs::remove_file(path)?;
+        // unlink while redb still holds the file lock, so nothing can open the path between
+        // closing it and deleting it
+        #[cfg(unix)]
+        {
+            let removed = std::fs::remove_file(&path);
+            drop(inner);
+            removed?;
+        }
+
+        // an open file can't be deleted here, so close first; another process could open the
+        // path in between
+        #[cfg(not(unix))]
+        {
+            drop(inner);
+            std::fs::remove_file(&path)?;
         }
 
         Ok(())
@@ -354,7 +368,12 @@ impl<S: State> Inner<S> {
             return Ok(());
         }
 
-        match self.write(&changes) {
+        // a panicking storage backend is treated like a failed commit, since the write may or
+        // may not have landed
+        let written = catch_unwind(AssertUnwindSafe(|| self.write(&changes)))
+            .unwrap_or_else(|panic| Err(Error::BackendPanicked(panic_message(&panic))));
+
+        match written {
             Ok(()) => {
                 self.publish(next, changes.fields);
                 Ok(())
@@ -397,8 +416,8 @@ impl<S: State> Inner<S> {
         if let Some(reopen) = &self.reopen {
             *slot = None;
 
-            let reopened = reopen()
-                .map_err(Error::from)
+            let reopened = catch_unwind(AssertUnwindSafe(reopen))
+                .unwrap_or_else(|panic| Err(Error::BackendPanicked(panic_message(&panic))))
                 .and_then(|db| load::<S>(&db, Some(&previous)).map(|state| (db, state)));
 
             if let Ok((db, state)) = reopened {
@@ -459,6 +478,14 @@ impl<S: State> Inner<S> {
     }
 }
 
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "storage backend panicked".to_owned())
+}
+
 fn storage_error(error: UpdateError<Infallible>) -> Error {
     match error {
         UpdateError::Storage(error) => error,
@@ -477,13 +504,13 @@ fn load<S: State>(db: &Database, previous: Option<&S>) -> Result<S> {
     Ok(state)
 }
 
-type OpenOnce = Box<dyn FnOnce(&redb::Builder) -> Result<Database, redb::DatabaseError>>;
+type OpenOnce = Box<dyn FnOnce(&redb::Builder) -> Result<Database, redb::DatabaseError> + Send>;
 
 enum Source {
     Default,
     Path(PathBuf),
     Backend(OpenOnce),
-    BackendWith(Arc<dyn Fn() -> Result<Database, redb::DatabaseError> + Send + Sync>),
+    BackendWith(Arc<dyn Fn() -> Result<Database> + Send + Sync>),
 }
 
 /// Configures where durable state is stored
@@ -539,12 +566,14 @@ impl<S: State> Builder<S> {
 
     /// Stores the state through custom backends made by `make`, which is called again to reopen
     /// the storage after an I/O error
+    ///
+    /// An error from `make` fails the open, or poisons the handle if it happens while reopening
     pub fn backend_with<B: StorageBackend>(
         mut self,
-        make: impl Fn() -> B + Send + Sync + 'static,
+        make: impl Fn() -> std::io::Result<B> + Send + Sync + 'static,
     ) -> Self {
         self.source = Source::BackendWith(Arc::new(move || {
-            Database::builder().create_with_backend(make())
+            Ok(Database::builder().create_with_backend(make()?)?)
         }));
         self
     }
@@ -582,7 +611,9 @@ impl<S: State> Builder<S> {
                 Durable::from_db(db, None, Some(Box::new(move || open())))
             }
             Source::Default | Source::Path(_) => {
-                let path = path.expect("file sources always resolve a path");
+                // an absolute path keeps `destroy` and recovery pointed at this file even if the
+                // process changes its working directory later
+                let path = std::path::absolute(path.expect("file sources always resolve a path"))?;
                 if let Some(parent) = path
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
@@ -594,7 +625,8 @@ impl<S: State> Builder<S> {
                 let db = Database::create(&path)?;
 
                 let reopen_path = path.clone();
-                let reopen: Reopen = Box::new(move || Database::create(&reopen_path));
+                // reopening must find the same file; creating an empty one would lose the state
+                let reopen: Reopen = Box::new(move || Ok(Database::open(&reopen_path)?));
                 Durable::from_db(db, Some(path), Some(reopen))
             }
         }

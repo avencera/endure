@@ -4,7 +4,8 @@ use std::collections::HashSet;
 
 use heck::ToSnakeCase;
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use proc_macro_crate::{FoundCrate, crate_name};
+use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
 use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream};
@@ -94,8 +95,21 @@ enum FieldKind {
     Skipped(Ident),
 }
 
+// the path to the endure crate as the user's manifest names it, so a renamed dependency works
+fn endure_path() -> TokenStream2 {
+    match crate_name("endure") {
+        Ok(FoundCrate::Name(name)) => {
+            let name = Ident::new(&name, Span::call_site());
+            quote! { ::#name }
+        }
+        // inside endure's own tests and examples, and when the lookup fails, use the real name
+        Ok(FoundCrate::Itself) | Err(_) => quote! { ::endure },
+    }
+}
+
 fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     let name = &input.ident;
+    let krate = endure_path();
 
     if !input.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
@@ -152,7 +166,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             let table = &field.table;
             let version = field.current_version();
             Some(quote! {
-                ::endure::__private::FieldSpec { name: #field_name, table: #table, version: #version }
+                #krate::__private::FieldSpec { name: #field_name, table: #table, version: #version }
             })
         }
         FieldKind::Skipped(_) => None,
@@ -165,11 +179,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             let table = &field.table;
             let oldest = field.oldest_version();
             let current = field.current_version();
-            let decode = decode_chain(field);
+            let decode = decode_chain(field, &krate);
             quote! {
                 #ident: loader.field::<#ty>(
                     #table,
-                    ::endure::__private::Versions { oldest: #oldest, current: #current },
+                    #krate::__private::Versions { oldest: #oldest, current: #current },
                     |__version: u32, __bytes: &[u8]| { #decode },
                 )?
             }
@@ -196,20 +210,20 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     });
 
     Ok(quote! {
-        impl ::endure::__private::State for #name {
+        impl #krate::__private::State for #name {
             const NAME: &'static str = #file_name;
             const APP: &'static str = ::core::env!("CARGO_PKG_NAME");
 
-            fn fields() -> &'static [::endure::__private::FieldSpec] {
-                const FIELDS: &[::endure::__private::FieldSpec] = &[#(#specs),*];
+            fn fields() -> &'static [#krate::__private::FieldSpec] {
+                const FIELDS: &[#krate::__private::FieldSpec] = &[#(#specs),*];
                 FIELDS
             }
 
             #[allow(unused_variables)]
             fn load(
-                loader: &mut ::endure::__private::Loader<'_>,
+                loader: &mut #krate::__private::Loader<'_>,
                 previous: ::core::option::Option<&Self>,
-            ) -> ::endure::Result<Self> {
+            ) -> #krate::Result<Self> {
                 ::core::result::Result::Ok(Self { #(#loads),* })
             }
 
@@ -217,8 +231,8 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             fn take_changes(
                 &mut self,
                 previous: &Self,
-                changes: &mut ::endure::__private::Changes,
-            ) -> ::endure::Result<()> {
+                changes: &mut #krate::__private::Changes,
+            ) -> #krate::Result<()> {
                 #(#takes)*
                 ::core::result::Result::Ok(())
             }
@@ -226,18 +240,18 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
         impl #name {
             /// Opens this state at its default location
-            pub fn open() -> ::endure::Result<::endure::Durable<Self>> {
-                ::endure::Durable::open()
+            pub fn open() -> #krate::Result<#krate::Durable<Self>> {
+                #krate::Durable::open()
             }
 
             /// Starts configuring where this state is stored
-            pub fn builder() -> ::endure::Builder<Self> {
-                ::endure::Durable::builder()
+            pub fn builder() -> #krate::Builder<Self> {
+                #krate::Durable::builder()
             }
 
             /// Opens a fresh copy of this state that lives only in memory
-            pub fn memory() -> ::endure::Durable<Self> {
-                ::endure::Durable::memory()
+            pub fn memory() -> #krate::Durable<Self> {
+                #krate::Durable::memory()
             }
         }
     })
@@ -372,10 +386,10 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
 }
 
 // decodes bytes written at `__version`, then converts step by step up to the current item type
-fn decode_chain(field: &PersistedField) -> TokenStream2 {
+fn decode_chain(field: &PersistedField, krate: &TokenStream2) -> TokenStream2 {
     let ty = &field.ty;
     let table = &field.table;
-    let item = quote! { <#ty as ::endure::__private::Field>::Item };
+    let item = quote! { <#ty as #krate::__private::Field>::Item };
 
     let arms = field.versions.iter().enumerate().map(|(index, old)| {
         let number = old.number;
@@ -387,7 +401,7 @@ fn decode_chain(field: &PersistedField) -> TokenStream2 {
 
         quote! {
             #number => {
-                let __value: #old_ty = ::endure::__private::decode(#table, __bytes)?;
+                let __value: #old_ty = #krate::__private::decode(#table, __bytes)?;
                 #(#steps)*
                 let __value: #item = ::core::convert::From::from(__value);
                 ::core::result::Result::Ok(__value)
@@ -398,7 +412,7 @@ fn decode_chain(field: &PersistedField) -> TokenStream2 {
     quote! {
         match __version {
             #(#arms)*
-            _ => ::endure::__private::decode::<#item>(#table, __bytes),
+            _ => #krate::__private::decode::<#item>(#table, __bytes),
         }
     }
 }

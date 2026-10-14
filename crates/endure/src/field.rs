@@ -118,8 +118,11 @@ pub struct Versions {
     pub current: u32,
 }
 
+// schema version of each field's table, keyed by table name
 const META: TableDefinition<&str, u32> = TableDefinition::new("__endure_meta");
-const FORMAT_KEY: &str = "__format";
+// kept apart from META so no table name can collide with it
+const FORMAT: TableDefinition<&str, u32> = TableDefinition::new("__endure_format");
+const FORMAT_KEY: &str = "version";
 const FORMAT_VERSION: u32 = 1;
 
 pub(crate) fn table(name: &str) -> TableDefinition<'_, &'static [u8], &'static [u8]> {
@@ -134,8 +137,8 @@ pub struct Loader<'txn> {
 
 impl<'txn> Loader<'txn> {
     pub(crate) fn new(txn: &'txn WriteTransaction) -> Result<Self> {
-        let mut meta = txn.open_table(META)?;
-        let format = meta.get(FORMAT_KEY)?.map(|guard| guard.value());
+        let mut format_table = txn.open_table(FORMAT)?;
+        let format = format_table.get(FORMAT_KEY)?.map(|guard| guard.value());
 
         match format {
             Some(found) if found > FORMAT_VERSION => {
@@ -146,7 +149,7 @@ impl<'txn> Loader<'txn> {
             }
             Some(_) => {}
             None => {
-                meta.insert(FORMAT_KEY, FORMAT_VERSION)?;
+                format_table.insert(FORMAT_KEY, FORMAT_VERSION)?;
             }
         }
 

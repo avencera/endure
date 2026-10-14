@@ -46,6 +46,10 @@ pub enum Error {
     #[error("commit failed and may or may not have been saved: {0}")]
     CommitFailed(Box<Error>),
 
+    /// The storage backend panicked during a commit or reopen
+    #[error("storage backend panicked: {0}")]
+    BackendPanicked(String),
+
     /// The file was written by a newer, incompatible version of endure
     #[error("database format version {found} is newer than the supported version {supported}")]
     UnsupportedFormat { found: u32, supported: u32 },

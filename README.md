@@ -167,11 +167,11 @@ A build that finds data written by a newer version of a field refuses to open wi
 
 ## Custom storage
 
-Any redb `StorageBackend` works, for example one that encrypts pages at rest. Pass a function that builds it, so endure can reopen the storage after an I/O error:
+Any redb `StorageBackend` works, for example one that encrypts pages at rest. Pass a function that builds it, so endure can reopen the storage after an I/O error. The function returns `io::Result`, so opening can fail cleanly:
 
 ```rust
 let app = App::builder()
-    .backend_with(move || MyEncryptedBackend::open(&path, &key))
+    .backend_with(move || MyEncryptedBackend::open(&path, &key)) // -> io::Result<MyEncryptedBackend>
     .open()?;
 ```
 
@@ -184,7 +184,7 @@ let app = App::builder()
 - Updates commit in the order they acquire the fair writer lock.
 - A failed commit returns `Error::CommitFailed`. Its changes may or may not have reached storage, so endure reopens the storage and reloads, and `read()` then shows what was actually saved. Don't retry blindly; check the state first.
 - If storage can't be reopened, the handle is poisoned: `is_poisoned()` returns true, updates return `Error::Poisoned`, and reads may be stale until you open the state again.
-- Only one process can open a file at a time.
+- Only one process can open a file at a time. A relative path is resolved when the state opens, so later changes to the working directory don't redirect it. `destroy` deletes the file while still holding its lock (on Unix), so nobody can open it in between.
 
 ## Limits
 

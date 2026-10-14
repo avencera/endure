@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/endure", "crates/endure-derive"]
+members = ["crates/endure", "crates/endure-derive", "crates/endure-rename-check"]
 
 [workspace.package]
 version = "0.1.0"
