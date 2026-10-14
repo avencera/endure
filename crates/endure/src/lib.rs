@@ -73,6 +73,7 @@ mod codec;
 mod error;
 mod map;
 mod store;
+mod tracker;
 mod vec;
 
 #[doc(hidden)]

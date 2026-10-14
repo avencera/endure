@@ -186,6 +186,7 @@ fn a_commit_that_landed_keeps_its_memory_only_edits() -> eyre::Result<()> {
         s.entries.insert(2, "saved".into());
         s.cache.push(2);
     });
+
     assert!(
         matches!(result, Err(Error::CommitFailed(_))),
         "got {result:?}"
@@ -209,6 +210,7 @@ fn single_use_backend_poisons_after_a_failed_commit() -> eyre::Result<()> {
     let store = Store::builder()
         .backend(FlakyBackend::open(&path, faults.clone())?)
         .open()?;
+
     store.update_blocking(|s| s.entries.insert(1, "kept".into()))?;
 
     faults.fail_next(usize::MAX);
@@ -217,6 +219,7 @@ fn single_use_backend_poisons_after_a_failed_commit() -> eyre::Result<()> {
         matches!(result, Err(Error::CommitFailed(_))),
         "got {result:?}"
     );
+
     assert!(store.is_poisoned());
 
     faults.fail_next(0);
@@ -250,6 +253,7 @@ async fn async_failed_commit_recovers_on_the_writer_thread() -> eyre::Result<()>
         matches!(result, Err(Error::CommitFailed(_))),
         "got {result:?}"
     );
+
     assert!(!store.is_poisoned());
     assert_eq!(store.read().cache, vec![7]);
 
@@ -259,6 +263,7 @@ async fn async_failed_commit_recovers_on_the_writer_thread() -> eyre::Result<()>
     store
         .update(|s| s.entries.insert(3, "after".into()))
         .await?;
+
     let in_memory = keys(&store);
     drop(store);
 
@@ -297,6 +302,7 @@ fn a_factory_that_fails_to_reopen_poisons_the_handle() -> eyre::Result<()> {
         matches!(result, Err(Error::CommitFailed(_))),
         "got {result:?}"
     );
+
     assert!(store.is_poisoned());
     Ok(())
 }
@@ -372,6 +378,7 @@ fn a_panicking_backend_fails_the_commit_and_reloads() -> eyre::Result<()> {
         matches!(result, Err(Error::CommitFailed(_))),
         "got {result:?}"
     );
+
     assert!(!store.is_poisoned());
 
     let in_memory = keys(&store);
@@ -432,6 +439,7 @@ fn opening_a_current_file_commits_nothing() -> eyre::Result<()> {
             syncs: Arc::clone(&syncs),
         })
     };
+
     let synced_by = |open: &dyn Fn() -> eyre::Result<()>| -> eyre::Result<usize> {
         let before = syncs.load(Ordering::SeqCst);
         open()?;
@@ -447,6 +455,7 @@ fn opening_a_current_file_commits_nothing() -> eyre::Result<()> {
         drop(Database::builder().create_with_backend(backend()?)?);
         Ok(())
     })?;
+
     let endure = synced_by(&|| {
         let store = Store::builder().backend(backend()?).open()?;
         assert_eq!(keys(&store), [1]);

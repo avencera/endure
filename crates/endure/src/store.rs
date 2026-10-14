@@ -5,7 +5,7 @@ use std::ops::Deref;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 
 use arc_swap::ArcSwap;
 use redb::{Database, StorageBackend};
@@ -19,9 +19,7 @@ use crate::field::{self, Changes, Loader, State};
 /// Cloning is cheap and every clone shares the same state. Reads return committed snapshots.
 /// Writes go through [`update`](Self::update) and friends, which take a fair writer lock, so
 /// updates commit in the order they reach it
-pub struct Durable<S: State> {
-    inner: Arc<Inner<S>>,
-}
+pub struct Durable<S: State>(Arc<Inner<S>>);
 
 struct Inner<S: State> {
     // only touched while the writer lock is held
@@ -134,6 +132,7 @@ impl<S> Clone for Commit<S> {
 
 impl<S> Commit<S> {
     /// Returns true if the named field changed
+    #[must_use]
     pub fn changed(&self, field: &str) -> bool {
         self.changed.contains(&field)
     }
@@ -141,9 +140,7 @@ impl<S> Commit<S> {
 
 impl<S: State> Clone for Durable<S> {
     fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
+        Self(Arc::clone(&self.0))
     }
 }
 
@@ -151,7 +148,7 @@ impl<S: State> fmt::Debug for Durable<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Durable")
             .field("state", &S::NAME)
-            .field("path", &self.inner.path)
+            .field("path", &self.0.path)
             .finish()
     }
 }
@@ -170,6 +167,7 @@ impl<S: State> Durable<S> {
     }
 
     /// Opens a fresh state that lives only in memory, for tests and scratch use
+    #[must_use]
     pub fn memory() -> Self {
         Self::builder()
             .in_memory()
@@ -180,21 +178,24 @@ impl<S: State> Durable<S> {
     /// Returns the latest committed snapshot
     ///
     /// This is a cheap pointer load with no I/O
+    #[must_use]
     pub fn read(&self) -> Snapshot<S> {
-        Snapshot(self.inner.current.load_full())
+        Snapshot(self.0.current.load_full())
     }
 
     /// Returns the file backing this state, or `None` for in-memory and custom backends
+    #[must_use]
     pub fn path(&self) -> Option<&Path> {
-        self.inner.path.as_deref()
+        self.0.path.as_deref()
     }
 
     /// Returns true if a failed commit left the handle unable to reload its state
     ///
     /// A poisoned handle refuses updates and its reads may be stale. Drop every handle and open
     /// the state again
+    #[must_use]
     pub fn is_poisoned(&self) -> bool {
-        self.inner.poisoned.load(Ordering::Acquire)
+        self.0.poisoned.load(Ordering::Acquire)
     }
 
     /// Applies `f` to a copy of the state and commits the changes it made
@@ -218,17 +219,17 @@ impl<S: State> Durable<S> {
         &self,
         f: impl FnOnce(&mut S) -> Result<T, E>,
     ) -> Result<T, UpdateError<E>> {
-        let writer = Arc::clone(&self.inner.writer).lock_owned().await;
-        let (output, next, changes) = self.inner.prepare(f)?;
+        let writer = Arc::clone(&self.0.writer).lock_owned().await;
+        let (output, next, changes) = self.0.prepare(f)?;
 
         if changes.is_empty() {
-            self.inner.publish(next, Vec::new());
+            self.0.publish(next, Vec::new());
             return Ok(output);
         }
 
         let (reply, done) = oneshot::channel();
-        self.inner.submit(Job {
-            inner: Arc::clone(&self.inner),
+        self.0.submit(Job {
+            inner: Arc::clone(&self.0),
             writer,
             next,
             changes,
@@ -240,7 +241,7 @@ impl<S: State> Durable<S> {
             Ok(result) => result.map_err(UpdateError::Storage)?,
             // the writer thread died without answering, so the outcome is unknown
             Err(_) => {
-                self.inner.poisoned.store(true, Ordering::Release);
+                self.0.poisoned.store(true, Ordering::Release);
                 return Err(UpdateError::Storage(Error::Poisoned));
             }
         }
@@ -269,17 +270,18 @@ impl<S: State> Durable<S> {
         &self,
         f: impl FnOnce(&mut S) -> Result<T, E>,
     ) -> Result<T, UpdateError<E>> {
-        let _writer = self.inner.writer.blocking_lock();
-        let (output, next, changes) = self.inner.prepare(f)?;
-        self.inner.commit(next, changes)?;
+        let _writer = self.0.writer.blocking_lock();
+        let (output, next, changes) = self.0.prepare(f)?;
+        self.0.commit(next, changes)?;
         Ok(output)
     }
 
     /// Subscribes to changes; the receiver always holds the most recent one
     ///
     /// Use this to refresh a UI or wake a task when state changes
+    #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<Commit<S>> {
-        self.inner.commits.subscribe()
+        self.0.commits.subscribe()
     }
 
     /// Runs `hook` synchronously after every change, in commit order
@@ -292,7 +294,7 @@ impl<S: State> Durable<S> {
     /// so use [`subscribe`](Self::subscribe) when the reaction needs the handle
     pub fn on_commit(&self, hook: impl Fn(&Commit<S>) + Send + Sync + 'static) {
         let hook: Arc<Hook<S>> = Arc::new(hook);
-        self.inner.hooks.rcu(|hooks| {
+        self.0.hooks.rcu(|hooks| {
             let mut hooks = Vec::clone(hooks);
             hooks.push(Arc::clone(&hook));
             hooks
@@ -304,7 +306,7 @@ impl<S: State> Durable<S> {
     /// Fails with [`Error::InUse`] if other clones of this handle are alive, or while a commit
     /// from a dropped `update` future is still finishing
     pub fn destroy(self) -> Result<()> {
-        let inner = Arc::try_unwrap(self.inner).map_err(|_| Error::InUse)?;
+        let inner = Arc::try_unwrap(self.0).map_err(|_| Error::InUse)?;
         let Some(path) = inner.path.clone() else {
             return Ok(());
         };
@@ -342,22 +344,20 @@ impl<S: State> Durable<S> {
             changed: Arc::from([]),
         });
 
-        Ok(Self {
-            inner: Arc::new(Inner {
-                storage: Mutex::new(Storage {
-                    db: Some(db),
-                    last_commit,
-                }),
-                reopen,
-                path,
-                current: ArcSwap::new(snapshot.0),
-                writer: Arc::new(tokio::sync::Mutex::new(())),
-                poisoned: AtomicBool::new(false),
-                commits,
-                hooks: ArcSwap::from_pointee(Vec::new()),
-                jobs: OnceLock::new(),
+        Ok(Self(Arc::new(Inner {
+            storage: Mutex::new(Storage {
+                db: Some(db),
+                last_commit,
             }),
-        })
+            reopen,
+            path,
+            current: ArcSwap::new(snapshot.0),
+            writer: Arc::new(tokio::sync::Mutex::new(())),
+            poisoned: AtomicBool::new(false),
+            commits,
+            hooks: ArcSwap::from_pointee(Vec::new()),
+            jobs: OnceLock::new(),
+        })))
     }
 }
 
@@ -387,10 +387,8 @@ impl<S: State> Inner<S> {
             return Ok(());
         }
 
-        let mut storage = self
-            .storage
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut storage = self.storage.lock().unwrap_or_else(PoisonError::into_inner);
+
         let number = storage.last_commit + 1;
 
         // a panicking storage backend is treated like a failed commit, since the write may or
@@ -564,6 +562,7 @@ enum Source {
 /// By default the file is `<state dir>/<crate name>/<struct name>.redb`, where the state dir is
 /// `$XDG_STATE_HOME` (usually `~/.local/state`) on Linux, `~/Library/Application Support` on
 /// macOS, and `%LOCALAPPDATA%` on Windows. The crate name is the package that defines the struct
+#[must_use]
 pub struct Builder<S> {
     dir: Option<PathBuf>,
     name: Option<String>,
@@ -635,48 +634,56 @@ impl<S: State> Builder<S> {
             Source::Path(path) => Ok(Some(path.clone())),
             Source::Backend(_) | Source::BackendWith(_) => Ok(None),
             Source::Default => {
-                let dir = match &self.dir {
-                    Some(dir) => dir.clone(),
-                    None => default_dir()?.join(S::APP),
-                };
-
-                let name = self.name.as_deref().unwrap_or(S::NAME);
-                Ok(Some(dir.join(format!("{name}.redb"))))
+                default_path::<S>(self.dir.as_deref(), self.name.as_deref()).map(Some)
             }
         }
     }
 
     /// Opens the state, creating the file and its directory if needed
     pub fn open(self) -> Result<Durable<S>> {
-        let path = self.resolved_path()?;
-
         match self.source {
             Source::Backend(open) => Durable::from_db(open(&Database::builder())?, None, None),
             Source::BackendWith(open) => {
                 let db = open()?;
                 Durable::from_db(db, None, Some(Box::new(move || open())))
             }
-            Source::Default | Source::Path(_) => {
-                // an absolute path keeps `destroy` and recovery pointed at this file even if the
-                // process changes its working directory later
-                let path = std::path::absolute(path.expect("file sources always resolve a path"))?;
-                if let Some(parent) = path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                {
-                    create_private_dir(parent)?;
-                }
-
-                create_private_file(&path)?;
-                let db = Database::create(&path)?;
-
-                let reopen_path = path.clone();
-                // reopening must find the same file; creating an empty one would lose the state
-                let reopen: Reopen = Box::new(move || Ok(Database::open(&reopen_path)?));
-                Durable::from_db(db, Some(path), Some(reopen))
-            }
+            Source::Path(path) => open_file(path),
+            Source::Default => open_file(default_path::<S>(
+                self.dir.as_deref(),
+                self.name.as_deref(),
+            )?),
         }
     }
+}
+
+fn default_path<S: State>(dir: Option<&Path>, name: Option<&str>) -> Result<PathBuf> {
+    let dir = match dir {
+        Some(dir) => dir.to_path_buf(),
+        None => default_dir()?.join(S::APP),
+    };
+
+    let name = name.unwrap_or(S::NAME);
+    Ok(dir.join(format!("{name}.redb")))
+}
+
+fn open_file<S: State>(path: PathBuf) -> Result<Durable<S>> {
+    // an absolute path keeps `destroy` and recovery pointed at this file even if the
+    // process changes its working directory later
+    let path = std::path::absolute(path)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_private_dir(parent)?;
+    }
+
+    create_private_file(&path)?;
+    let db = Database::create(&path)?;
+
+    let reopen_path = path.clone();
+    // reopening must find the same file; creating an empty one would lose the state
+    let reopen: Reopen = Box::new(move || Ok(Database::open(&reopen_path)?));
+    Durable::from_db(db, Some(path), Some(reopen))
 }
 
 fn default_dir() -> Result<PathBuf> {

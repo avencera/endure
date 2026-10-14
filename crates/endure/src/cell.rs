@@ -6,7 +6,8 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
 use crate::error::{Error, Result};
-use crate::field::{self, Field, Layout, Op};
+use crate::field::{Field, Layout, Op};
+use crate::tracker::{Pending, Tracker};
 
 // a cell is stored as a single row under this key
 const CELL_KEY: &[u8] = b"";
@@ -19,28 +20,28 @@ const CELL_KEY: &[u8] = b"";
 pub struct DurableCell<T> {
     // shared so cloning the state for an update stays O(1) however large the value is
     value: Arc<T>,
-    dirty: bool,
-    // identity of the committed value this cell derives from
-    epoch: u64,
+    // a cell has one row, so a touch of `()` means the value changed
+    tracker: Tracker<()>,
 }
 
 impl<T: Clone> DurableCell<T> {
     /// Creates a cell holding `value`
+    #[must_use]
     pub fn new(value: T) -> Self {
         Self {
             value: Arc::new(value),
-            dirty: false,
-            epoch: field::next_epoch(),
+            tracker: Tracker::new(),
         }
     }
 
     /// Replaces the value
     pub fn set(&mut self, value: T) {
         self.value = Arc::new(value);
-        self.dirty = true;
+        self.tracker.touch(&(), true);
     }
 
     /// Returns a reference to the value
+    #[must_use]
     pub fn get(&self) -> &T {
         &self.value
     }
@@ -56,8 +57,7 @@ impl<T> Clone for DurableCell<T> {
     fn clone(&self) -> Self {
         Self {
             value: Arc::clone(&self.value),
-            dirty: self.dirty,
-            epoch: self.epoch,
+            tracker: self.tracker.clone(),
         }
     }
 }
@@ -72,7 +72,7 @@ impl<T> Deref for DurableCell<T> {
 
 impl<T: Clone> DerefMut for DurableCell<T> {
     fn deref_mut(&mut self) -> &mut T {
-        self.dirty = true;
+        self.tracker.touch(&(), true);
         Arc::make_mut(&mut self.value)
     }
 }
@@ -129,8 +129,10 @@ where
 
     fn take_ops(&mut self, previous: &Self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
         // a replaced cell is written even if the replacement was never marked changed
-        let changed = std::mem::take(&mut self.dirty) || self.epoch != previous.epoch;
-        self.epoch = field::next_epoch();
+        let changed = match self.tracker.take(&previous.tracker) {
+            Pending::Rewrite => true,
+            Pending::Keys(dirty) => !dirty.is_empty(),
+        };
 
         if changed {
             self.all_ops(table, ops)?;

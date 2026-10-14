@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 
 use endure::{Durable, DurableMap, DurableVec};
-use proptest::prelude::*;
+use proptest::prelude::{
+    Just, ProptestConfig, Strategy, any, prop, prop_assert_eq, prop_oneof, proptest,
+};
 use tempfile::TempDir;
 
 #[derive(Clone, Durable)]
@@ -208,6 +210,7 @@ fn repeated_front_inserts_renumber_without_losing_order() -> eyre::Result<()> {
         .chain((1..200).rev())
         .chain(std::iter::once(u32::MAX))
         .collect();
+
     assert_eq!(
         state.read().list.iter().copied().collect::<Vec<_>>(),
         expected
@@ -219,5 +222,6 @@ fn repeated_front_inserts_renumber_without_losing_order() -> eyre::Result<()> {
         state.read().list.iter().copied().collect::<Vec<_>>(),
         expected
     );
+
     Ok(())
 }

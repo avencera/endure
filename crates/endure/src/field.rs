@@ -2,23 +2,9 @@
 //!
 //! Everything here is public only so generated code can reach it. It is not a stable API
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use redb::{ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::error::{Error, Result};
-
-static EPOCH: AtomicU64 = AtomicU64::new(1);
-
-/// Returns a new identity for a collection's contents
-///
-/// Every loaded, created, or committed collection gets a fresh epoch. An update compares each
-/// field's epoch with the committed state it started from, so a field that was replaced
-/// wholesale (`s.map = DurableMap::new()`, `mem::take`, or a clone of an older snapshot) is
-/// rewritten in full instead of silently skipped
-pub(crate) fn next_epoch() -> u64 {
-    EPOCH.fetch_add(1, Ordering::Relaxed)
-}
 
 /// One pending write to a table: a put when `value` is `Some`, a delete otherwise
 #[derive(Debug)]

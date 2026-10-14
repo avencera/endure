@@ -25,9 +25,11 @@ fn a_relative_path_stays_tied_to_the_file_that_was_opened() -> eyre::Result<()> 
         !first.path().join("state.redb").exists(),
         "the opened file is deleted"
     );
+
     assert_eq!(
         std::fs::read(second.path().join("state.redb"))?,
         b"unrelated"
     );
+
     Ok(())
 }

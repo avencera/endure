@@ -83,5 +83,6 @@ async fn main() -> eyre::Result<()> {
             .map(|p| p.display().to_string())
             .unwrap_or_default()
     );
+
     Ok(())
 }

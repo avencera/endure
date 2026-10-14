@@ -311,6 +311,7 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
                             "expected `versions(OldType = 1, NewerType = 2, ..)`",
                         )
                     })?;
+
                 versions.extend(parsed);
                 Ok(())
             } else {
@@ -332,6 +333,25 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
         return Ok(FieldKind::Skipped(ident));
     }
 
+    validate_versions(field, &versions, current)?;
+
+    let name = ident.unraw().to_string();
+    let table = table.unwrap_or_else(|| name.clone());
+    Ok(FieldKind::Persisted(Box::new(PersistedField {
+        ident,
+        name,
+        ty: field.ty.clone(),
+        table,
+        versions,
+        current,
+    })))
+}
+
+fn validate_versions(
+    field: &syn::Field,
+    versions: &[OldVersion],
+    current: Option<u32>,
+) -> syn::Result<()> {
     if let Some(first) = versions.first()
         && first.number == 0
     {
@@ -341,12 +361,10 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
         ));
     }
 
-    // the current version is one past the last listed one, so that one must leave room
-    if let Some(last) = versions.last()
-        && last.number == u32::MAX
-    {
+    // every listed version is followed by one more, either listed or the current one
+    if let Some(old) = versions.iter().find(|old| old.number == u32::MAX) {
         return Err(syn::Error::new_spanned(
-            &last.ty,
+            &old.ty,
             "a listed schema version must be below u32::MAX",
         ));
     }
@@ -383,16 +401,7 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
         ));
     }
 
-    let name = ident.unraw().to_string();
-    let table = table.unwrap_or_else(|| name.clone());
-    Ok(FieldKind::Persisted(Box::new(PersistedField {
-        ident,
-        name,
-        ty: field.ty.clone(),
-        table,
-        versions,
-        current,
-    })))
+    Ok(())
 }
 
 // decodes bytes written at `__version`, then converts step by step up to the current item type

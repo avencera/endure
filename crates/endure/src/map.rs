@@ -1,5 +1,4 @@
 use std::borrow::Borrow;
-use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::{Index, RangeBounds};
 
@@ -7,7 +6,8 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
 use crate::error::{Error, Result};
-use crate::field::{self, Field, Layout, Op};
+use crate::field::{Field, Layout, Op};
+use crate::tracker::{Pending, Tracker};
 
 /// An ordered map whose entries persist across restarts
 ///
@@ -16,35 +16,33 @@ use crate::field::{self, Field, Layout, Op};
 /// because the entries live in a structurally shared tree
 pub struct DurableMap<K, V> {
     entries: imbl::OrdMap<K, V>,
-    // keys touched since the last commit, each with whether it was stored before the update;
-    // the key's presence at commit decides put or delete, and a key that was neither stored
-    // before nor present now needs no write at all
-    dirty: BTreeMap<K, bool>,
-    // identity of the committed contents this map derives from
-    epoch: u64,
+    tracker: Tracker<K>,
 }
 
 impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
     /// Creates an empty map
+    #[must_use]
     pub fn new() -> Self {
         Self {
             entries: imbl::OrdMap::new(),
-            dirty: BTreeMap::new(),
-            epoch: field::next_epoch(),
+            tracker: Tracker::new(),
         }
     }
 
     /// Returns the number of entries
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Returns true if the map has no entries
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// Returns the value for `key`
+    #[must_use]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
@@ -54,6 +52,7 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
     }
 
     /// Returns true if the map has an entry for `key`
+    #[must_use]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -71,14 +70,14 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
         // record the key before handing out the reference so a change can never go unseen
         let (stored_key, _) = self.entries.get_key_value(key)?;
         let stored_key = stored_key.clone();
-        self.touch(&stored_key, true);
+        self.tracker.touch(&stored_key, true);
         self.entries.get_mut(key)
     }
 
     /// Returns a mutable reference to the value for `key`, inserting `default()` first if absent
     pub fn get_or_insert_with(&mut self, key: K, default: impl FnOnce() -> V) -> &mut V {
         let existed = self.entries.contains_key(&key);
-        self.touch(&key, existed);
+        self.tracker.touch(&key, existed);
         if !existed {
             self.entries.insert(key.clone(), default());
         }
@@ -88,7 +87,7 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
 
     /// Inserts a value, returning the previous value for the key
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.touch(&key, self.entries.contains_key(&key));
+        self.tracker.touch(&key, self.entries.contains_key(&key));
         self.entries.insert(key, value)
     }
 
@@ -99,7 +98,7 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
         Q: Ord + ?Sized,
     {
         let (stored_key, value) = self.entries.remove_with_key(key)?;
-        self.touch(&stored_key, true);
+        self.tracker.touch(&stored_key, true);
         Some(value)
     }
 
@@ -114,15 +113,14 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
 
         for key in removed {
             self.entries.remove(&key);
-            self.touch(&key, true);
+            self.tracker.touch(&key, true);
         }
     }
 
     /// Removes every entry
     pub fn clear(&mut self) {
-        let keys: Vec<K> = self.entries.keys().cloned().collect();
-        for key in &keys {
-            self.touch(key, true);
+        for key in self.entries.keys() {
+            self.tracker.touch(key, true);
         }
 
         self.entries.clear();
@@ -130,9 +128,10 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
 
     /// Calls `f` on every entry with mutable access, marking every key changed
     pub fn for_each_mut(&mut self, mut f: impl FnMut(&K, &mut V)) {
+        // the keys are collected because the entries cannot be iterated while being mutated
         let keys: Vec<K> = self.entries.keys().cloned().collect();
         for key in keys {
-            self.touch(&key, true);
+            self.tracker.touch(&key, true);
             if let Some(value) = self.entries.get_mut(&key) {
                 f(&key, value);
             }
@@ -165,21 +164,15 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
     }
 
     /// Returns the entry with the smallest key
+    #[must_use]
     pub fn first(&self) -> Option<(&K, &V)> {
         self.entries.get_min().map(|(key, value)| (key, value))
     }
 
     /// Returns the entry with the largest key
+    #[must_use]
     pub fn last(&self) -> Option<(&K, &V)> {
         self.entries.get_max().map(|(key, value)| (key, value))
-    }
-
-    // a key's first touch in an update records whether it was stored before; it is present now
-    // exactly when it was stored before, because any earlier change would have touched it already
-    fn touch(&mut self, key: &K, present: bool) {
-        if !self.dirty.contains_key(key) {
-            self.dirty.insert(key.clone(), present);
-        }
     }
 }
 
@@ -193,8 +186,7 @@ impl<K: Clone, V: Clone> Clone for DurableMap<K, V> {
     fn clone(&self) -> Self {
         Self {
             entries: self.entries.clone(),
-            dirty: self.dirty.clone(),
-            epoch: self.epoch,
+            tracker: self.tracker.clone(),
         }
     }
 }
@@ -276,9 +268,9 @@ where
 
         let map = Self {
             entries,
-            dirty: BTreeMap::new(),
-            epoch: field::next_epoch(),
+            tracker: Tracker::new(),
         };
+
         Ok((map, layout))
     }
 
@@ -294,38 +286,37 @@ where
     }
 
     fn take_ops(&mut self, previous: &Self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
-        let dirty = std::mem::take(&mut self.dirty);
-        let replaced = self.epoch != previous.epoch;
-        self.epoch = field::next_epoch();
+        match self.tracker.take(&previous.tracker) {
+            // the map was swapped for a different one, so its dirty set says nothing about storage
+            Pending::Rewrite => {
+                for key in previous.entries.keys() {
+                    if !self.entries.contains_key(key) {
+                        ops.push(Op {
+                            key: codec::encode_checked(table, key)?,
+                            value: None,
+                        });
+                    }
+                }
 
-        // the map was swapped for a different one, so its dirty set says nothing about storage
-        if replaced {
-            for key in previous.entries.keys() {
-                if !self.entries.contains_key(key) {
+                self.all_ops(table, ops)
+            }
+            Pending::Keys(dirty) => {
+                for (key, was_stored) in dirty {
+                    let value = match self.entries.get(&key) {
+                        Some(value) => Some(codec::encode_checked(table, value)?),
+                        // added and removed within one update, so storage never saw it
+                        None if !was_stored => continue,
+                        None => None,
+                    };
+
                     ops.push(Op {
-                        key: codec::encode_checked(table, key)?,
-                        value: None,
+                        key: codec::encode_checked(table, &key)?,
+                        value,
                     });
                 }
+
+                Ok(())
             }
-
-            return self.all_ops(table, ops);
         }
-
-        for (key, was_stored) in dirty {
-            let value = match self.entries.get(&key) {
-                Some(value) => Some(codec::encode_checked(table, value)?),
-                // added and removed within one update, so storage never saw it
-                None if !was_stored => continue,
-                None => None,
-            };
-
-            ops.push(Op {
-                key: codec::encode_checked(table, &key)?,
-                value,
-            });
-        }
-
-        Ok(())
     }
 }

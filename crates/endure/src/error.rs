@@ -109,6 +109,7 @@ pub enum UpdateError<E> {
 
 impl<E> UpdateError<E> {
     /// Returns the closure's error, if the closure rejected the update
+    #[must_use]
     pub fn rejected(self) -> Option<E> {
         match self {
             Self::Rejected(error) => Some(error),

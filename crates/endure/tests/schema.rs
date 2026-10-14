@@ -113,6 +113,7 @@ fn write_v1(dir: &TempDir) -> eyre::Result<()> {
                 granted: true,
             },
         );
+
         s.approvals.insert(
             2,
             v1::Approval {
@@ -120,6 +121,7 @@ fn write_v1(dir: &TempDir) -> eyre::Result<()> {
                 granted: false,
             },
         );
+
         s.settings.max_parallel = 3;
         s.notes.push("first".into());
     })?;
@@ -141,6 +143,7 @@ fn values_upgrade_through_listed_versions() -> eyre::Result<()> {
             state: v2::State::Granted
         }
     );
+
     assert_eq!(state.approvals[&2].state, v2::State::Pending);
     assert_eq!(state.settings.max_parallel, 3);
     assert_eq!(state.settings.theme, "");
@@ -169,6 +172,7 @@ fn chains_skip_straight_from_the_oldest_version() -> eyre::Result<()> {
             uses: 0
         }
     );
+
     assert!(!state.approvals[&2].granted);
     Ok(())
 }
@@ -298,6 +302,7 @@ fn an_explicit_version_survives_dropping_every_old_entry() -> eyre::Result<()> {
         ),
         "got {result:?}"
     );
+
     Ok(())
 }
 
@@ -360,6 +365,7 @@ fn keys_stored_before_a_key_field_was_added_can_be_updated_and_removed() -> eyre
         .iter()
         .map(|(k, v)| (k.id, v.clone()))
         .collect();
+
     assert_eq!(items, [(2, "new".to_owned())]);
     Ok(())
 }
@@ -392,6 +398,7 @@ fn keys_stored_before_a_key_field_was_removed_can_be_updated() -> eyre::Result<(
         .iter()
         .map(|(k, v)| (k.id, v.clone()))
         .collect();
+
     assert_eq!(items, [(7, "new".to_owned())]);
     Ok(())
 }

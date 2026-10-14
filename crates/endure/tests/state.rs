@@ -44,6 +44,7 @@ async fn changes_survive_reopen() -> eyre::Result<()> {
                     done: false,
                 },
             );
+
             s.tasks.insert(
                 2,
                 Task {
@@ -51,6 +52,7 @@ async fn changes_survive_reopen() -> eyre::Result<()> {
                     done: false,
                 },
             );
+
             s.settings.max_parallel = 4;
             s.history.push("created".into());
             s.scratch.push(7);
@@ -77,11 +79,13 @@ async fn changes_survive_reopen() -> eyre::Result<()> {
             done: true
         }
     );
+
     assert_eq!(state.settings.max_parallel, 4);
     assert_eq!(
         state.history.iter().cloned().collect::<Vec<_>>(),
         ["created", "finished build"]
     );
+
     assert!(state.scratch.is_empty(), "skipped fields are memory only");
     Ok(())
 }
@@ -142,6 +146,7 @@ fn panicking_update_changes_nothing() -> eyre::Result<()> {
         app.read().history.iter().cloned().collect::<Vec<_>>(),
         ["before", "after"]
     );
+
     Ok(())
 }
 
@@ -182,6 +187,7 @@ async fn concurrent_updates_apply_in_order() -> eyre::Result<()> {
         state.log.iter().copied().collect::<Vec<_>>(),
         (1..=50).collect::<Vec<_>>()
     );
+
     Ok(())
 }
 
@@ -222,6 +228,7 @@ async fn commits_notify_subscribers_and_hooks() -> eyre::Result<()> {
         *seen.lock().unwrap(),
         vec![vec!["settings"], vec!["history"]]
     );
+
     Ok(())
 }
 
@@ -269,6 +276,7 @@ fn default_location_uses_crate_and_struct_names() -> eyre::Result<()> {
         .dir("/tmp/x")
         .name("approvals")
         .resolved_path()?;
+
     assert_eq!(
         named.as_deref(),
         Some(std::path::Path::new("/tmp/x/approvals.redb"))
@@ -278,6 +286,7 @@ fn default_location_uses_crate_and_struct_names() -> eyre::Result<()> {
         .path("/tmp/y.redb")
         .dir("/ignored")
         .resolved_path()?;
+
     assert_eq!(exact.as_deref(), Some(std::path::Path::new("/tmp/y.redb")));
     Ok(())
 }
@@ -287,6 +296,7 @@ fn custom_backends_work() -> eyre::Result<()> {
     let app = App::builder()
         .backend(endure::redb::backends::InMemoryBackend::new())
         .open()?;
+
     assert!(app.path().is_none());
 
     app.update_blocking(|s| {
@@ -298,6 +308,7 @@ fn custom_backends_work() -> eyre::Result<()> {
             },
         )
     })?;
+
     assert_eq!(app.read().tasks.len(), 1);
     Ok(())
 }
@@ -322,6 +333,7 @@ fn map_range_and_order() -> eyre::Result<()> {
         state.tasks.keys().copied().collect::<Vec<_>>(),
         [1, 3, 5, 7, 9]
     );
+
     assert_eq!(
         state
             .tasks
@@ -330,6 +342,7 @@ fn map_range_and_order() -> eyre::Result<()> {
             .collect::<Vec<_>>(),
         [3, 5, 7]
     );
+
     assert_eq!(state.tasks.first().map(|(id, _)| *id), Some(1));
     assert_eq!(state.tasks.last().map(|(id, _)| *id), Some(9));
     Ok(())
@@ -351,6 +364,7 @@ async fn cancelled_update_still_commits_and_publishes() -> eyre::Result<()> {
                 },
             );
         });
+
         tokio::pin!(update);
         let _ = futures_poll_once(update.as_mut()).await;
     }
@@ -374,6 +388,7 @@ async fn cancelled_update_still_commits_and_publishes() -> eyre::Result<()> {
         in_memory, on_disk,
         "memory and disk must agree after a cancelled update"
     );
+
     assert!(on_disk.contains(&2));
     Ok(())
 }
@@ -404,6 +419,7 @@ async fn a_panicking_hook_does_not_fail_the_commit() -> eyre::Result<()> {
         commits.has_changed()?,
         "subscribers still hear about the commit"
     );
+
     assert_eq!(*later_hook_ran.lock().unwrap(), 1);
     assert_eq!(app.read().settings.max_parallel, 2);
     Ok(())
@@ -485,6 +501,7 @@ async fn values_that_cannot_round_trip_are_refused() -> eyre::Result<()> {
         matches!(result, Err(Error::Encode { .. })),
         "got {result:?}"
     );
+
     assert_eq!(items.read().item.name, "");
 
     drop(items);
@@ -506,6 +523,7 @@ async fn changes_that_cancel_out_write_nothing() -> eyre::Result<()> {
                 done: false,
             },
         );
+
         s.tasks.remove(&9);
         s.history.push("temporary".into());
         s.history.pop();
@@ -516,6 +534,7 @@ async fn changes_that_cancel_out_write_nothing() -> eyre::Result<()> {
         !commits.has_changed()?,
         "nothing reached storage, so nothing was announced"
     );
+
     Ok(())
 }
 
@@ -566,6 +585,7 @@ async fn replacing_a_whole_collection_is_saved() -> eyre::Result<()> {
                 done: false,
             },
         );
+
         s.tasks.insert(
             2,
             Task {
@@ -573,6 +593,7 @@ async fn replacing_a_whole_collection_is_saved() -> eyre::Result<()> {
                 done: false,
             },
         );
+
         s.history.push("one".into());
         s.settings.max_parallel = 3;
     })
@@ -600,6 +621,7 @@ async fn replacing_a_whole_collection_is_saved() -> eyre::Result<()> {
                 done: false,
             },
         );
+
         std::mem::take(&mut s.history);
         s.settings = DurableCell::new(Settings {
             max_parallel: 8,
@@ -708,6 +730,7 @@ fn a_caught_comparator_panic_still_saves_the_order() -> eyre::Result<()> {
         reopened.read().list.iter().copied().collect::<Vec<_>>(),
         in_memory
     );
+
     Ok(())
 }
 
@@ -736,6 +759,7 @@ fn builders_can_move_to_another_thread() -> eyre::Result<()> {
     let app = std::thread::spawn(move || builder.open())
         .join()
         .expect("thread")?;
+
     assert!(app.path().is_some());
     Ok(())
 }

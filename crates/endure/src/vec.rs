@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Index;
 
@@ -7,7 +6,8 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
 use crate::error::{Error, Result};
-use crate::field::{self, Field, Layout, Op};
+use crate::field::{Field, Layout, Op};
+use crate::tracker::{Pending, Tracker};
 
 // each element is stored under a hidden u64 order key; keys increase along the vector and leave
 // gaps so a push or an insert writes one row instead of shifting every later element
@@ -23,46 +23,46 @@ pub struct DurableVec<T> {
     items: imbl::Vector<T>,
     // order key of each element, strictly increasing, parallel to `items`
     keys: imbl::Vector<u64>,
-    // order keys touched since the last commit, each with whether it was stored before the
-    // update; present keys are written, absent ones deleted, and keys that were never stored
-    // and are gone again need no write
-    dirty: BTreeMap<u64, bool>,
-    // identity of the committed contents this list derives from
-    epoch: u64,
+    tracker: Tracker<u64>,
 }
 
 impl<T: Clone> DurableVec<T> {
     /// Creates an empty list
+    #[must_use]
     pub fn new() -> Self {
         Self {
             items: imbl::Vector::new(),
             keys: imbl::Vector::new(),
-            dirty: BTreeMap::new(),
-            epoch: field::next_epoch(),
+            tracker: Tracker::new(),
         }
     }
 
     /// Returns the number of elements
+    #[must_use]
     pub fn len(&self) -> usize {
         self.items.len()
     }
 
     /// Returns true if the list is empty
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
     /// Returns the element at `index`
+    #[must_use]
     pub fn get(&self, index: usize) -> Option<&T> {
         self.items.get(index)
     }
 
     /// Returns the first element
+    #[must_use]
     pub fn first(&self) -> Option<&T> {
         self.items.front()
     }
 
     /// Returns the last element
+    #[must_use]
     pub fn last(&self) -> Option<&T> {
         self.items.back()
     }
@@ -70,7 +70,7 @@ impl<T: Clone> DurableVec<T> {
     /// Returns a mutable reference to the element at `index`, marking it changed
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
         let key = *self.keys.get(index)?;
-        self.touch(key, true);
+        self.tracker.touch(&key, true);
         self.items.get_mut(index)
     }
 
@@ -85,7 +85,7 @@ impl<T: Clone> DurableVec<T> {
             }
         };
 
-        self.touch(key, false);
+        self.tracker.touch(&key, false);
         self.keys.push_back(key);
         self.items.push_back(value);
     }
@@ -98,14 +98,14 @@ impl<T: Clone> DurableVec<T> {
     /// Removes and returns the last element
     pub fn pop(&mut self) -> Option<T> {
         let key = self.keys.pop_back()?;
-        self.touch(key, true);
+        self.tracker.touch(&key, true);
         self.items.pop_back()
     }
 
     /// Removes and returns the first element
     pub fn pop_front(&mut self) -> Option<T> {
         let key = self.keys.pop_front()?;
-        self.touch(key, true);
+        self.tracker.touch(&key, true);
         self.items.pop_front()
     }
 
@@ -135,7 +135,7 @@ impl<T: Clone> DurableVec<T> {
             }
         };
 
-        self.touch(key, false);
+        self.tracker.touch(&key, false);
         self.keys.insert(index, key);
         self.items.insert(index, value);
     }
@@ -147,7 +147,7 @@ impl<T: Clone> DurableVec<T> {
     /// Panics if `index >= len`
     pub fn remove(&mut self, index: usize) -> T {
         let key = self.keys.remove(index);
-        self.touch(key, true);
+        self.tracker.touch(&key, true);
         self.items.remove(index)
     }
 
@@ -157,9 +157,8 @@ impl<T: Clone> DurableVec<T> {
             return;
         }
 
-        let removed: Vec<u64> = self.keys.iter().skip(len).copied().collect();
-        for key in removed {
-            self.touch(key, true);
+        for key in self.keys.iter().skip(len) {
+            self.tracker.touch(key, true);
         }
 
         self.keys.truncate(len);
@@ -230,22 +229,15 @@ impl<T: Clone> DurableVec<T> {
             .collect();
 
         // a new key equal to an old one was already touched as stored, so this keeps it
-        let fresh: Vec<u64> = self.keys.iter().copied().collect();
-        for key in fresh {
-            self.touch(key, false);
+        for key in self.keys.iter() {
+            self.tracker.touch(key, false);
         }
     }
 
     fn touch_all(&mut self) {
-        let keys: Vec<u64> = self.keys.iter().copied().collect();
-        for key in keys {
-            self.touch(key, true);
+        for key in self.keys.iter() {
+            self.tracker.touch(key, true);
         }
-    }
-
-    // a key's first touch in an update records whether it was stored before the update
-    fn touch(&mut self, key: u64, stored: bool) {
-        self.dirty.entry(key).or_insert(stored);
     }
 }
 
@@ -260,8 +252,7 @@ impl<T: Clone> Clone for DurableVec<T> {
         Self {
             items: self.items.clone(),
             keys: self.keys.clone(),
-            dirty: self.dirty.clone(),
-            epoch: self.epoch,
+            tracker: self.tracker.clone(),
         }
     }
 }
@@ -344,38 +335,37 @@ where
     }
 
     fn take_ops(&mut self, previous: &Self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
-        let dirty = std::mem::take(&mut self.dirty);
-        let replaced = self.epoch != previous.epoch;
-        self.epoch = field::next_epoch();
+        match self.tracker.take(&previous.tracker) {
+            // the list was swapped for a different one, so its dirty set says nothing about storage
+            Pending::Rewrite => {
+                for key in previous.keys.iter() {
+                    if self.keys.binary_search(key).is_err() {
+                        ops.push(Op {
+                            key: key.to_be_bytes().to_vec(),
+                            value: None,
+                        });
+                    }
+                }
 
-        // the list was swapped for a different one, so its dirty set says nothing about storage
-        if replaced {
-            for key in previous.keys.iter() {
-                if self.keys.binary_search(key).is_err() {
+                self.all_ops(table, ops)
+            }
+            Pending::Keys(dirty) => {
+                for (key, was_stored) in dirty {
+                    let value = match self.keys.binary_search(&key) {
+                        Ok(index) => Some(codec::encode_checked(table, &self.items[index])?),
+                        // pushed and removed within one update, so storage never saw it
+                        Err(_) if !was_stored => continue,
+                        Err(_) => None,
+                    };
+
                     ops.push(Op {
                         key: key.to_be_bytes().to_vec(),
-                        value: None,
+                        value,
                     });
                 }
+
+                Ok(())
             }
-
-            return self.all_ops(table, ops);
         }
-
-        for (key, was_stored) in dirty {
-            let value = match self.keys.binary_search(&key) {
-                Ok(index) => Some(codec::encode_checked(table, &self.items[index])?),
-                // pushed and removed within one update, so storage never saw it
-                Err(_) if !was_stored => continue,
-                Err(_) => None,
-            };
-
-            ops.push(Op {
-                key: key.to_be_bytes().to_vec(),
-                value,
-            });
-        }
-
-        Ok(())
     }
 }
