@@ -17,7 +17,7 @@ Each `update` runs these steps while holding a FIFO writer lock:
 
 1. Clone the current snapshot. The collections are persistent trees (`imbl::OrdMap` and `imbl::Vector`), and cells hold an `Arc`, so this clone is O(number of fields), not O(data).
 2. Run the closure on the clone. Collections record which keys it touched: `get_mut`, `insert`, `remove` and the other mutators mark keys as they are called, not when a guard drops, so a change can't go unrecorded.
-3. Encode only the touched entries, check that each reads back to the same bytes, and write them in one redb write transaction.
+3. Encode only the touched entries, check that each decodes again, and write them in one redb write transaction.
 4. Publish the clone as the new snapshot with `arc-swap`, notify subscribers, and release the lock.
 
 If the closure returns an error or panics, or the commit fails, the clone is dropped and nobody ever saw it. Rollback costs nothing.
@@ -53,7 +53,9 @@ Each field lists its earlier value types with explicit, consecutive version numb
 
 ## Notifications
 
-Each commit produces a `Commit` with the new snapshot and the names of the persisted fields it changed. A reload after a failed commit produces one listing every field. Subscribers get it through a `tokio::sync::watch` channel, which always holds the latest commit. Subscribers are updated first, then `on_commit` hooks run synchronously, in commit order, while the writer lock is still held. A hook that panics is caught, so it can't fail a commit that already succeeded or hide it from subscribers. Hooks live in an `ArcSwap` list, so a hook can register another hook without deadlocking.
+Each commit produces a `Commit` with the new snapshot and the names of the persisted fields it changed. A reload after a failed commit produces one listing every field. Subscribers get it through a `tokio::sync::watch` channel, which always holds the latest commit. Subscribers are updated first, then `on_commit` hooks run synchronously, in commit order, while the writer lock is still held. For async updates that happens on the writer thread, which enters the caller's tokio runtime first, so hooks can spawn tasks. A hook that panics is caught, so it can't fail a commit that already succeeded or hide it from subscribers. Hooks live in an `ArcSwap` list, so a hook can register another hook without deadlocking.
+
+Each collection also carries an epoch, a process-wide unique number given to it when it is loaded, created, or committed. An update compares every field's epoch with the committed state it started from. A field replaced wholesale (`s.map = DurableMap::new()`, `mem::take`, or a clone from an older snapshot) has a different epoch, so endure rewrites its table: it deletes rows the new value lacks and writes every entry. That keeps memory and disk in agreement even when change tracking is bypassed.
 
 Collections record whether each touched key existed when the update started. A key that was added and removed within one update produces no write. An update whose changes all cancel out commits nothing and notifies no one.
 

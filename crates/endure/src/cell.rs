@@ -6,7 +6,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
 use crate::error::Result;
-use crate::field::{Field, Op};
+use crate::field::{self, Field, Op};
 
 // a cell is stored as a single row under this key
 const CELL_KEY: &[u8] = b"";
@@ -20,6 +20,8 @@ pub struct DurableCell<T> {
     // shared so cloning the state for an update stays O(1) however large the value is
     value: Arc<T>,
     dirty: bool,
+    // identity of the committed value this cell derives from
+    epoch: u64,
 }
 
 impl<T: Clone> DurableCell<T> {
@@ -28,6 +30,7 @@ impl<T: Clone> DurableCell<T> {
         Self {
             value: Arc::new(value),
             dirty: false,
+            epoch: field::next_epoch(),
         }
     }
 
@@ -54,6 +57,7 @@ impl<T> Clone for DurableCell<T> {
         Self {
             value: Arc::clone(&self.value),
             dirty: self.dirty,
+            epoch: self.epoch,
         }
     }
 }
@@ -106,16 +110,22 @@ where
         Ok(Self::new(value))
     }
 
-    fn mark_all_changed(&mut self) {
-        self.dirty = true;
+    fn all_ops(&self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
+        ops.push(Op {
+            key: CELL_KEY.to_vec(),
+            value: Some(codec::encode_checked(table, &*self.value)?),
+        });
+
+        Ok(())
     }
 
-    fn take_ops(&mut self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
-        if std::mem::take(&mut self.dirty) {
-            ops.push(Op {
-                key: CELL_KEY.to_vec(),
-                value: Some(codec::encode_checked(table, &*self.value)?),
-            });
+    fn take_ops(&mut self, previous: &Self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
+        // a replaced cell is written even if the replacement was never marked changed
+        let changed = std::mem::take(&mut self.dirty) || self.epoch != previous.epoch;
+        self.epoch = field::next_epoch();
+
+        if changed {
+            self.all_ops(table, ops)?;
         }
 
         Ok(())

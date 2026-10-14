@@ -7,7 +7,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
 use crate::error::Result;
-use crate::field::{Field, Op};
+use crate::field::{self, Field, Op};
 
 /// An ordered map whose entries persist across restarts
 ///
@@ -20,6 +20,8 @@ pub struct DurableMap<K, V> {
     // the key's presence at commit decides put or delete, and a key that was neither stored
     // before nor present now needs no write at all
     dirty: BTreeMap<K, bool>,
+    // identity of the committed contents this map derives from
+    epoch: u64,
 }
 
 impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
@@ -28,6 +30,7 @@ impl<K: Ord + Clone, V: Clone> DurableMap<K, V> {
         Self {
             entries: imbl::OrdMap::new(),
             dirty: BTreeMap::new(),
+            epoch: field::next_epoch(),
         }
     }
 
@@ -191,6 +194,7 @@ impl<K: Clone, V: Clone> Clone for DurableMap<K, V> {
         Self {
             entries: self.entries.clone(),
             dirty: self.dirty.clone(),
+            epoch: self.epoch,
         }
     }
 }
@@ -259,15 +263,41 @@ where
         Ok(Self {
             entries,
             dirty: BTreeMap::new(),
+            epoch: field::next_epoch(),
         })
     }
 
-    fn mark_all_changed(&mut self) {
-        self.dirty = self.entries.keys().map(|key| (key.clone(), true)).collect();
+    fn all_ops(&self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
+        for (key, value) in self.entries.iter() {
+            ops.push(Op {
+                key: codec::encode_checked(table, key)?,
+                value: Some(codec::encode_checked(table, value)?),
+            });
+        }
+
+        Ok(())
     }
 
-    fn take_ops(&mut self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
-        for (key, was_stored) in std::mem::take(&mut self.dirty) {
+    fn take_ops(&mut self, previous: &Self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
+        let dirty = std::mem::take(&mut self.dirty);
+        let replaced = self.epoch != previous.epoch;
+        self.epoch = field::next_epoch();
+
+        // the map was swapped for a different one, so its dirty set says nothing about storage
+        if replaced {
+            for key in previous.entries.keys() {
+                if !self.entries.contains_key(key) {
+                    ops.push(Op {
+                        key: codec::encode_checked(table, key)?,
+                        value: None,
+                    });
+                }
+            }
+
+            return self.all_ops(table, ops);
+        }
+
+        for (key, was_stored) in dirty {
             let value = match self.entries.get(&key) {
                 Some(value) => Some(codec::encode_checked(table, value)?),
                 // added and removed within one update, so storage never saw it

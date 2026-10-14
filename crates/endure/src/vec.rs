@@ -7,7 +7,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::codec;
 use crate::error::{Error, Result};
-use crate::field::{Field, Op};
+use crate::field::{self, Field, Op};
 
 // each element is stored under a hidden u64 order key; keys increase along the vector and leave
 // gaps so a push or an insert writes one row instead of shifting every later element
@@ -27,6 +27,8 @@ pub struct DurableVec<T> {
     // update; present keys are written, absent ones deleted, and keys that were never stored
     // and are gone again need no write
     dirty: BTreeMap<u64, bool>,
+    // identity of the committed contents this list derives from
+    epoch: u64,
 }
 
 impl<T: Clone> DurableVec<T> {
@@ -36,6 +38,7 @@ impl<T: Clone> DurableVec<T> {
             items: imbl::Vector::new(),
             keys: imbl::Vector::new(),
             dirty: BTreeMap::new(),
+            epoch: field::next_epoch(),
         }
     }
 
@@ -257,6 +260,7 @@ impl<T: Clone> Clone for DurableVec<T> {
             items: self.items.clone(),
             keys: self.keys.clone(),
             dirty: self.dirty.clone(),
+            epoch: self.epoch,
         }
     }
 }
@@ -326,12 +330,37 @@ where
         Ok(vec)
     }
 
-    fn mark_all_changed(&mut self) {
-        self.touch_all();
+    fn all_ops(&self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
+        for (key, item) in self.keys.iter().zip(self.items.iter()) {
+            ops.push(Op {
+                key: key.to_be_bytes().to_vec(),
+                value: Some(codec::encode_checked(table, item)?),
+            });
+        }
+
+        Ok(())
     }
 
-    fn take_ops(&mut self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
-        for (key, was_stored) in std::mem::take(&mut self.dirty) {
+    fn take_ops(&mut self, previous: &Self, table: &str, ops: &mut Vec<Op>) -> Result<()> {
+        let dirty = std::mem::take(&mut self.dirty);
+        let replaced = self.epoch != previous.epoch;
+        self.epoch = field::next_epoch();
+
+        // the list was swapped for a different one, so its dirty set says nothing about storage
+        if replaced {
+            for key in previous.keys.iter() {
+                if self.keys.binary_search(key).is_err() {
+                    ops.push(Op {
+                        key: key.to_be_bytes().to_vec(),
+                        value: None,
+                    });
+                }
+            }
+
+            return self.all_ops(table, ops);
+        }
+
+        for (key, was_stored) in dirty {
             let value = match self.keys.binary_search(&key) {
                 Ok(index) => Some(codec::encode_checked(table, &self.items[index])?),
                 // pushed and removed within one update, so storage never saw it

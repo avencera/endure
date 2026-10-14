@@ -35,7 +35,7 @@ struct Inner<S: State> {
     commits: watch::Sender<Commit<S>>,
     hooks: ArcSwap<Vec<Arc<Hook<S>>>>,
     // runs async commits; started on the first one
-    jobs: OnceLock<Mutex<mpsc::Sender<Job<S>>>>,
+    jobs: OnceLock<mpsc::Sender<Job<S>>>,
 }
 
 type Hook<S> = dyn Fn(&Commit<S>) + Send + Sync;
@@ -45,27 +45,38 @@ type Reopen = Box<dyn Fn() -> Result<Database, redb::DatabaseError> + Send + Syn
 // caller's future can never separate writing the changes from publishing them
 struct Job<S: State> {
     inner: Arc<Inner<S>>,
-    _writer: OwnedMutexGuard<()>,
+    writer: OwnedMutexGuard<()>,
     next: S,
     changes: Changes,
     reply: oneshot::Sender<Result<()>>,
+    // the caller's runtime, entered while hooks run so they can spawn tasks
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl<S: State> Job<S> {
     fn run(self) {
         let Self {
             inner,
-            _writer,
+            writer,
             next,
             changes,
             reply,
+            runtime,
         } = self;
 
-        let outcome = catch_unwind(AssertUnwindSafe(|| inner.commit(next, changes)));
-        let result = outcome.unwrap_or_else(|_| {
-            inner.poisoned.store(true, Ordering::Release);
-            Err(Error::Poisoned)
-        });
+        let result = {
+            let _runtime = runtime.as_ref().map(tokio::runtime::Handle::enter);
+            let outcome = catch_unwind(AssertUnwindSafe(|| inner.commit(next, changes)));
+            outcome.unwrap_or_else(|_| {
+                inner.poisoned.store(true, Ordering::Release);
+                Err(Error::Poisoned)
+            })
+        };
+
+        // release the handle and the lock before replying, so a caller that destroys or
+        // reopens the state right after the update finishes does not find it still in use
+        drop(writer);
+        drop(inner);
 
         // the caller may have stopped waiting; the commit and publish happened regardless
         let _ = reply.send(result);
@@ -211,10 +222,11 @@ impl<S: State> Durable<S> {
         let (reply, done) = oneshot::channel();
         self.inner.submit(Job {
             inner: Arc::clone(&self.inner),
-            _writer: writer,
+            writer,
             next,
             changes,
             reply,
+            runtime: tokio::runtime::Handle::try_current().ok(),
         });
 
         match done.await {
@@ -262,7 +274,9 @@ impl<S: State> Durable<S> {
     /// Runs `hook` synchronously after every change, in commit order
     ///
     /// Hooks run while the writer lock is held, so keep them short and never call `update` from
-    /// one. A hook that panics is skipped for that commit; the commit itself still succeeds.
+    /// one. After an async update they run on endure's writer thread with the caller's tokio
+    /// runtime entered, so `tokio::spawn` works. A hook that panics is skipped for that commit;
+    /// the commit itself still succeeds.
     /// A hook that captures a clone of this handle keeps the state open until the process exits,
     /// so use [`subscribe`](Self::subscribe) when the reaction needs the handle
     pub fn on_commit(&self, hook: impl Fn(&Commit<S>) + Send + Sync + 'static) {
@@ -276,7 +290,8 @@ impl<S: State> Durable<S> {
 
     /// Closes the state and deletes its file
     ///
-    /// Fails with [`Error::InUse`] if other clones of this handle are alive
+    /// Fails with [`Error::InUse`] if other clones of this handle are alive, or while a commit
+    /// from a dropped `update` future is still finishing
     pub fn destroy(self) -> Result<()> {
         let inner = Arc::try_unwrap(self.inner).map_err(|_| Error::InUse)?;
         let path = inner.path.clone();
@@ -323,11 +338,12 @@ impl<S: State> Inner<S> {
         }
 
         // the maps and lists inside are structurally shared, so this copy is cheap
-        let mut next = S::clone(&self.current.load());
+        let current = self.current.load_full();
+        let mut next = S::clone(&current);
         let output = f(&mut next).map_err(UpdateError::Rejected)?;
 
         let mut changes = Changes::default();
-        next.take_changes(&mut changes)?;
+        next.take_changes(&current, &mut changes)?;
         Ok((output, next, changes))
     }
 
@@ -433,10 +449,9 @@ impl<S: State> Inner<S> {
                 })
                 .expect("spawn endure writer thread");
 
-            Mutex::new(sender)
+            sender
         });
 
-        let sender = sender.lock().unwrap_or_else(|poison| poison.into_inner());
         if let Err(mpsc::SendError(job)) = sender.send(job) {
             // the writer thread is gone, so commit here rather than lose the update
             job.run();

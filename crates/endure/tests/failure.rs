@@ -198,3 +198,40 @@ fn single_use_backend_poisons_after_a_failed_commit() -> eyre::Result<()> {
     assert_eq!(keys_on_disk(&path), [1]);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_failed_commit_recovers_on_the_writer_thread() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("flaky.redb");
+    let faults = Faults::new(Fail::Write);
+
+    let store = reopenable(&path, &faults);
+    store
+        .update(|s| {
+            s.entries.insert(1, "kept".into());
+            s.cache.push(7);
+        })
+        .await?;
+
+    let mut commits = store.subscribe();
+    faults.fail_next(1);
+    let result = store.update(|s| s.entries.insert(2, "maybe".into())).await;
+    assert!(
+        matches!(result, Err(Error::CommitFailed(_))),
+        "got {result:?}"
+    );
+    assert!(!store.is_poisoned());
+    assert_eq!(store.read().cache, vec![7]);
+
+    // the reload is announced as a change to every field
+    assert!(commits.borrow_and_update().changed("entries"));
+
+    store
+        .update(|s| s.entries.insert(3, "after".into()))
+        .await?;
+    let in_memory = keys(&store);
+    drop(store);
+
+    assert_eq!(in_memory, keys_on_disk(&path));
+    Ok(())
+}

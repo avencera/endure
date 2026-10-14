@@ -33,6 +33,8 @@ use syn::{
 ///   are upgraded through `From` impls (`V1` into `V2`, `V2` into the current type) when the state
 ///   opens. Drop the oldest entries once no stored data needs them; data older than the first
 ///   listed version then fails to open instead of being misread
+/// - `#[durable(version = 3)]` sets the current version explicitly. Use it to keep the number
+///   after dropping every old entry, or alongside `versions(..)` as a check
 ///
 /// [`DurableMap`]: https://docs.rs/endure/latest/endure/struct.DurableMap.html
 /// [`DurableCell`]: https://docs.rs/endure/latest/endure/struct.DurableCell.html
@@ -52,15 +54,21 @@ struct PersistedField {
     ty: Type,
     table: String,
     versions: Vec<OldVersion>,
+    // set with `version = N`; otherwise one past the last listed version
+    current: Option<u32>,
 }
 
 impl PersistedField {
-    fn oldest_version(&self) -> u32 {
-        self.versions.first().map_or(1, |old| old.number)
+    fn current_version(&self) -> u32 {
+        self.current
+            .or_else(|| self.versions.last().map(|old| old.number + 1))
+            .unwrap_or(1)
     }
 
-    fn current_version(&self) -> u32 {
-        self.versions.last().map_or(1, |old| old.number + 1)
+    fn oldest_version(&self) -> u32 {
+        self.versions
+            .first()
+            .map_or_else(|| self.current_version(), |old| old.number)
     }
 }
 
@@ -180,7 +188,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
             let ident = &field.ident;
             let field_name = &field.name;
             let table = &field.table;
-            Some(quote! { changes.field(#field_name, #table, &mut self.#ident)?; })
+            Some(
+                quote! { changes.field(#field_name, #table, &mut self.#ident, &previous.#ident)?; },
+            )
         }
         FieldKind::Skipped(_) => None,
     });
@@ -203,7 +213,12 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 ::core::result::Result::Ok(Self { #(#loads),* })
             }
 
-            fn take_changes(&mut self, changes: &mut ::endure::__private::Changes) -> ::endure::Result<()> {
+            #[allow(unused_variables)]
+            fn take_changes(
+                &mut self,
+                previous: &Self,
+                changes: &mut ::endure::__private::Changes,
+            ) -> ::endure::Result<()> {
                 #(#takes)*
                 ::core::result::Result::Ok(())
             }
@@ -253,6 +268,7 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
     let mut skip = false;
     let mut table = None;
     let mut versions = Vec::new();
+    let mut current = None;
 
     for attr in field
         .attrs
@@ -266,6 +282,10 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
             } else if meta.path.is_ident("table") {
                 let value: LitStr = meta.value()?.parse()?;
                 table = Some(value.value());
+                Ok(())
+            } else if meta.path.is_ident("version") {
+                let value: LitInt = meta.value()?.parse()?;
+                current = Some(value.base10_parse::<u32>()?);
                 Ok(())
             } else if meta.path.is_ident("versions") {
                 let content;
@@ -281,17 +301,17 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
                 Ok(())
             } else {
                 Err(meta.error(
-                    "unknown durable field attribute; expected `skip`, `table`, or `versions`",
+                    "unknown durable field attribute; expected `skip`, `table`, `version`, or `versions`",
                 ))
             }
         })?;
     }
 
     if skip {
-        if table.is_some() || !versions.is_empty() {
+        if table.is_some() || !versions.is_empty() || current.is_some() {
             return Err(syn::Error::new_spanned(
                 &field.ident,
-                "a skipped field cannot also set `table` or `versions`",
+                "a skipped field cannot also set `table`, `version`, or `versions`",
             ));
         }
 
@@ -320,6 +340,25 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
         }
     }
 
+    if current == Some(0) {
+        return Err(syn::Error::new_spanned(
+            &field.ident,
+            "schema versions start at 1",
+        ));
+    }
+
+    if let (Some(current), Some(last)) = (current, versions.last())
+        && current != last.number + 1
+    {
+        return Err(syn::Error::new_spanned(
+            &last.ty,
+            format!(
+                "the last listed version must be {}, one before `version = {current}`",
+                current - 1
+            ),
+        ));
+    }
+
     let name = ident.unraw().to_string();
     let table = table.unwrap_or_else(|| name.clone());
     Ok(FieldKind::Persisted(Box::new(PersistedField {
@@ -328,6 +367,7 @@ fn field_kind(ident: Ident, field: &syn::Field) -> syn::Result<FieldKind> {
         ty: field.ty.clone(),
         table,
         versions,
+        current,
     })))
 }
 

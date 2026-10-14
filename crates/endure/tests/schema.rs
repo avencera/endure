@@ -261,3 +261,42 @@ fn cells_and_lists_upgrade_too() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+mod v5 {
+    use super::*;
+
+    // every old entry dropped, with the current number kept explicitly
+    #[derive(Clone, Durable)]
+    pub struct App {
+        #[durable(version = 3)]
+        pub approvals: DurableMap<u32, v3::Approval>,
+    }
+}
+
+#[test]
+fn an_explicit_version_survives_dropping_every_old_entry() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    write_v1(&dir)?;
+    drop(v3::App::builder().path(path(&dir)).open()?);
+
+    let app = v5::App::builder().path(path(&dir)).open()?;
+    assert!(app.read().approvals[&1].granted);
+    drop(app);
+
+    // a file still at version 1 is refused rather than misread
+    let older = TempDir::new()?;
+    write_v1(&older)?;
+    let result = v5::App::builder().path(path(&older)).open();
+    assert!(
+        matches!(
+            result,
+            Err(Error::OlderSchema {
+                found: 1,
+                oldest: 3,
+                ..
+            })
+        ),
+        "got {result:?}"
+    );
+    Ok(())
+}

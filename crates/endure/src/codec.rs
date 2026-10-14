@@ -16,23 +16,16 @@ pub fn encode<T: Serialize + ?Sized>(table: &str, value: &T) -> Result<Vec<u8>> 
     })
 }
 
-/// Encodes a value and checks that it reads back to the same bytes
+/// Encodes a value and checks that the bytes decode again
 ///
-/// This stops a serde shape that cannot round-trip, such as `skip_serializing_if` without
+/// This stops a serde shape that cannot be read back, such as `skip_serializing_if` without
 /// `default`, from writing a row that would make the file fail to open
 pub fn encode_checked<T: Serialize + DeserializeOwned>(table: &str, value: &T) -> Result<Vec<u8>> {
     let bytes = encode(table, value)?;
-    let decoded: T = decode(table, &bytes).map_err(|error| Error::Encode {
+    decode::<T>(table, &bytes).map_err(|error| Error::Encode {
         table: table.to_owned(),
         message: format!("the encoded value would not read back: {error}"),
     })?;
-
-    if encode(table, &decoded)? != bytes {
-        return Err(Error::Encode {
-            table: table.to_owned(),
-            message: "the value changes when read back".to_owned(),
-        });
-    }
 
     Ok(bytes)
 }

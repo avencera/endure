@@ -550,3 +550,125 @@ fn new_files_are_private() -> eyre::Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn replacing_a_whole_collection_is_saved() -> eyre::Result<()> {
+    let dir = TempDir::new()?;
+    let app = open_at(&dir);
+    app.update(|s| {
+        s.tasks.insert(
+            1,
+            Task {
+                name: "a".into(),
+                done: false,
+            },
+        );
+        s.tasks.insert(
+            2,
+            Task {
+                name: "b".into(),
+                done: false,
+            },
+        );
+        s.history.push("one".into());
+        s.settings.max_parallel = 3;
+    })
+    .await?;
+
+    let before = app.read();
+    app.update(|s| {
+        s.tasks.insert(
+            3,
+            Task {
+                name: "c".into(),
+                done: false,
+            },
+        )
+    })
+    .await?;
+
+    app.update(|s| {
+        // a fresh map, a taken list, a new cell, and a revert to an older snapshot
+        s.tasks = DurableMap::new();
+        s.tasks.insert(
+            9,
+            Task {
+                name: "fresh".into(),
+                done: false,
+            },
+        );
+        std::mem::take(&mut s.history);
+        s.settings = DurableCell::new(Settings {
+            max_parallel: 8,
+            theme: "x".into(),
+        });
+    })
+    .await?;
+
+    app.update(|s| s.tasks = before.tasks.clone()).await?;
+
+    let in_memory: Vec<u64> = app.read().tasks.keys().copied().collect();
+    drop(app);
+
+    let reopened = open_at(&dir);
+    let state = reopened.read();
+    assert_eq!(state.tasks.keys().copied().collect::<Vec<_>>(), in_memory);
+    assert_eq!(in_memory, [1, 2]);
+    assert!(state.history.is_empty());
+    assert_eq!(state.settings.max_parallel, 8);
+    Ok(())
+}
+
+#[tokio::test]
+async fn hash_maps_inside_values_are_stored() -> eyre::Result<()> {
+    #[derive(Clone, Durable)]
+    struct Tagged {
+        tags: DurableCell<std::collections::HashMap<String, u32>>,
+    }
+
+    let dir = TempDir::new()?;
+    let state = Tagged::builder().dir(dir.path()).open()?;
+    state
+        .update(|s| {
+            for index in 0..32 {
+                s.tags.insert(format!("tag {index}"), index);
+            }
+        })
+        .await?;
+
+    drop(state);
+    let state = Tagged::builder().dir(dir.path()).open()?;
+    assert_eq!(state.read().tags.len(), 32);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn destroy_right_after_an_update_succeeds() -> eyre::Result<()> {
+    for _ in 0..100 {
+        let dir = TempDir::new()?;
+        let app = open_at(&dir);
+        app.update(|s| s.history.push("x".into())).await?;
+        app.destroy()?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hooks_after_async_updates_can_spawn_tasks() -> eyre::Result<()> {
+    let app = App::memory();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+    app.on_commit(move |commit| {
+        let sender = sender.clone();
+        let changed = commit.changed.to_vec();
+        tokio::spawn(async move {
+            let _ = sender.send(changed);
+        });
+    });
+
+    app.update(|s| s.history.push("x".into())).await?;
+    let changed = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv()).await?;
+    assert_eq!(changed, Some(vec!["history"]));
+    Ok(())
+}

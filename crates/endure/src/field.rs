@@ -2,9 +2,23 @@
 //!
 //! Everything here is public only so generated code can reach it. It is not a stable API
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use redb::{ReadableTable, TableDefinition, WriteTransaction};
 
 use crate::error::{Error, Result};
+
+static EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Returns a new identity for a collection's contents
+///
+/// Every loaded, created, or committed collection gets a fresh epoch. An update compares each
+/// field's epoch with the committed state it started from, so a field that was replaced
+/// wholesale (`s.map = DurableMap::new()`, `mem::take`, or a clone of an older snapshot) is
+/// rewritten in full instead of silently skipped
+pub(crate) fn next_epoch() -> u64 {
+    EPOCH.fetch_add(1, Ordering::Relaxed)
+}
 
 /// One pending write to a table: a put when `value` is `Some`, a delete otherwise
 #[derive(Debug)]
@@ -25,11 +39,12 @@ pub trait Field: Clone + Send + Sync + 'static {
         decode: &dyn Fn(&[u8]) -> Result<Self::Item>,
     ) -> Result<Self>;
 
-    /// Marks every element changed so the next commit rewrites all of them
-    fn mark_all_changed(&mut self);
+    /// Writes every element, for rewriting a whole table
+    fn all_ops(&self, table: &str, ops: &mut Vec<Op>) -> Result<()>;
 
-    /// Moves the pending changes into `ops`, encoding the current values
-    fn take_ops(&mut self, table: &str, ops: &mut Vec<Op>) -> Result<()>;
+    /// Moves the changes made since `previous`, the committed value this update started from,
+    /// into `ops`, then gives the field a new epoch
+    fn take_ops(&mut self, previous: &Self, table: &str, ops: &mut Vec<Op>) -> Result<()>;
 }
 
 /// Describes one persisted field of a state struct
@@ -58,8 +73,8 @@ pub trait State: Clone + Send + Sync + Sized + 'static {
     /// Memory-only fields are copied from `previous` when reloading, or start as their default
     fn load(loader: &mut Loader<'_>, previous: Option<&Self>) -> Result<Self>;
 
-    /// Moves every field's pending changes into `changes`
-    fn take_changes(&mut self, changes: &mut Changes) -> Result<()>;
+    /// Moves every field's changes since `previous` into `changes`
+    fn take_changes(&mut self, previous: &Self, changes: &mut Changes) -> Result<()>;
 }
 
 /// The writes produced by one update
@@ -76,9 +91,10 @@ impl Changes {
         name: &'static str,
         table: &'static str,
         field: &mut F,
+        previous: &F,
     ) -> Result<()> {
         let mut ops = Vec::new();
-        field.take_ops(table, &mut ops)?;
+        field.take_ops(previous, table, &mut ops)?;
 
         if !ops.is_empty() {
             self.fields.push(name);
@@ -179,12 +195,11 @@ impl<'txn> Loader<'txn> {
             });
         }
 
-        let mut field = F::load(table_name, rows, &|bytes| decode(stored, bytes))?;
+        let field = F::load(table_name, rows, &|bytes| decode(stored, bytes))?;
 
         if stored < versions.current {
-            field.mark_all_changed();
             let mut ops = Vec::new();
-            field.take_ops(table_name, &mut ops)?;
+            field.all_ops(table_name, &mut ops)?;
             apply(&mut table, &ops)?;
         }
 

@@ -37,7 +37,7 @@ app.update(|s| {
 
 Pushing, inserting or removing one `DurableVec` element writes one row; nothing shifts on disk. Cloning any collection is O(1), because the data lives in structurally shared trees from [imbl](https://github.com/jneem/imbl).
 
-Keys and values need `Clone` and serde's `Serialize` and `Deserialize`. Map keys also need `Ord`. Before anything is written, endure checks that each changed value reads back to the same bytes. A type that can't round-trip, such as one using `skip_serializing_if` without `default`, is refused with `Error::Encode` instead of leaving a file that won't open.
+Keys and values need `Clone` and serde's `Serialize` and `Deserialize`. Map keys also need `Ord`. Before anything is written, endure checks that each changed value can be decoded again. A type that can't be read back, such as one using `skip_serializing_if` without `default`, is refused with `Error::Encode` instead of leaving a file that won't open.
 
 Fields marked `#[durable(skip)]` live in memory only and start as `Default::default()`.
 
@@ -146,7 +146,7 @@ struct App {
 }
 ```
 
-When no stored data needs a version any more, drop its entry. The numbers are explicit, so data older than the first listed version fails to open with `Error::OlderSchema` instead of being decoded as the wrong type.
+When no stored data needs a version any more, drop its entry. The numbers are explicit, so data older than the first listed version fails to open with `Error::OlderSchema` instead of being decoded as the wrong type. To drop every old entry, keep the current number with `#[durable(version = 3)]`.
 
 To rename a field without losing its data, keep the old table name: `#[durable(table = "old_name")]`.
 
@@ -179,11 +179,12 @@ let app = App::builder()
 - A `DurableCell` holds its value behind an `Arc`, so the first change in an update copies the whole value and the commit rewrites it. Keep large collections in a `DurableMap` or `DurableVec`.
 - Map keys are not versioned. Changing a key type needs a manual migration. Keys that compare equal with `Ord` must also serialize identically.
 - Values must not use interior mutability such as `RefCell` or `Mutex`. Changes made through them bypass change tracking and are never saved.
-- `Option<Option<T>>` can't tell `Some(None)` from `None` once stored.
+- Serde attributes that lose data, such as `#[serde(skip)]`, apply on disk too. After a restart a skipped field comes back as its default. `Option<Option<T>>` can't tell `Some(None)` from `None` once stored.
+- If an `update` future is dropped while its commit is still finishing, `destroy` returns `Error::InUse` until the commit completes.
 - Removing a field leaves its table in the file. Adding a field with the same name later reads the old data.
 - `get_mut` and `DerefMut` mark an entry changed even if you don't modify it, so it is rewritten.
 - The derive adds `open`, `builder` and `memory` functions to the struct, so it can't have its own functions with those names.
-- Commit hooks run while the writer lock is held, so they must not call `update`. A hook that captures a clone of the handle keeps the file open for the life of the process; use `subscribe` when the reaction needs the handle.
+- Commit hooks run while the writer lock is held, so they must not call `update`. After an async update they run on endure's writer thread with your tokio runtime entered. A hook that captures a clone of the handle keeps the file open for the life of the process; use `subscribe` when the reaction needs the handle.
 
 ## Not yet
 
