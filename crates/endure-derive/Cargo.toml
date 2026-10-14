@@ -1,0 +1,17 @@
+[package]
+name = "endure-derive"
+description = "Derive macro for endure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "3", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+heck = "0.5"
